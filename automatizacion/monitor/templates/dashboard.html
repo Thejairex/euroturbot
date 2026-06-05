@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Monitor de Automatización</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <h1>🤖 Monitor de Automatización</h1>
+  <div class="status-bar">
+    <span class="status-indicator" id="statusDot"></span>
+    <span id="statusText">Inactivo</span>
+  </div>
+</header>
+
+<main>
+  <section class="controls">
+    <button id="btnStart" class="btn btn-primary">▶ Iniciar</button>
+    <button id="btnRefresh" class="btn btn-secondary">🔄 Refrescar</button>
+  </section>
+
+  <section class="progress-section">
+    <h2>Progreso</h2>
+    <div class="progress-bar">
+      <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+    </div>
+    <div class="progress-info">
+      <span id="progressText">0%</span>
+      <span id="elapsedText">⏱ 0s</span>
+    </div>
+  </section>
+
+  <section class="summary">
+    <div class="card ok">
+      <span class="card-label">OK</span>
+      <span class="card-value" id="countOk">0</span>
+    </div>
+    <div class="card failed">
+      <span class="card-label">Fallos</span>
+      <span class="card-value" id="countFailed">0</span>
+    </div>
+    <div class="card skipped">
+      <span class="card-label">Saltados</span>
+      <span class="card-value" id="countSkipped">0</span>
+    </div>
+    <div class="card total">
+      <span class="card-label">Total</span>
+      <span class="card-value" id="countTotal">0</span>
+    </div>
+  </section>
+
+  <section class="steps">
+    <h2>Pasos</h2>
+    <table id="stepsTable">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Nombre</th>
+          <th>Estado</th>
+          <th>Duración</th>
+          <th>Error</th>
+        </tr>
+      </thead>
+      <tbody id="stepsBody"></tbody>
+    </table>
+  </section>
+
+  <section class="logs">
+    <h2>Logs</h2>
+    <pre id="logOutput"><div class="log-empty">Esperando actividad...</div></pre>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+
+const statusDot = $('statusDot');
+const statusText = $('statusText');
+const progressFill = $('progressFill');
+const progressText = $('progressText');
+const elapsedText = $('elapsedText');
+const stepsBody = $('stepsBody');
+const logOutput = $('logOutput');
+
+function setStatus(running, error) {
+  if (error) {
+    statusDot.className = 'status-indicator error';
+    statusText.textContent = 'Error';
+  } else if (running) {
+    statusDot.className = 'status-indicator running';
+    statusText.textContent = 'Ejecutando...';
+  } else {
+    statusDot.className = 'status-indicator idle';
+    statusText.textContent = 'Inactivo';
+  }
+}
+
+function updateStats(data) {
+  const pct = data.progress_pct || 0;
+  progressFill.style.width = pct + '%';
+  progressText.textContent = pct + '%';
+  elapsedText.textContent = '⏱ ' + data.elapsed_seconds + 's';
+  $('countOk').textContent = data.ok || 0;
+  $('countFailed').textContent = data.failed || 0;
+  $('countSkipped').textContent = data.skipped || 0;
+  $('countTotal').textContent = data.total || 0;
+  setStatus(data.running, data.error);
+
+  stepsBody.innerHTML = '';
+  if (data.steps && data.steps.length > 0) {
+    data.steps.forEach((s, i) => {
+      const tr = document.createElement('tr');
+      let icon = '⏳';
+      if (s.status === 'ok') icon = '✅';
+      else if (s.status === 'failed') icon = '❌';
+      else if (s.status === 'running') icon = '🔄';
+      else if (s.status === 'skipped') icon = '⏭️';
+      tr.innerHTML = `
+        <td>${i + 1}</td>
+        <td>${s.name}</td>
+        <td class="status-${s.status}">${icon} ${s.status}</td>
+        <td>${s.duration || '-'}s</td>
+        <td class="error-cell">${s.error || '-'}</td>
+      `;
+      stepsBody.appendChild(tr);
+    });
+  } else {
+    stepsBody.innerHTML = '<tr><td colspan="5" class="empty">Sin pasos aún</td></tr>';
+  }
+}
+
+function fetchLogs() {
+  fetch('/api/logs?lines=50')
+    .then(r => r.json())
+    .then(data => {
+      if (data.logs && data.logs.length > 0) {
+        logOutput.innerHTML = data.logs.map(l => '<div>' + escapeHtml(l) + '</div>').join('');
+        logOutput.scrollTop = logOutput.scrollHeight;
+      }
+    })
+    .catch(() => {});
+}
+
+function escapeHtml(text) {
+  const d = document.createElement('div');
+  d.textContent = text;
+  return d.innerHTML;
+}
+
+function connectSSE() {
+  const evtSource = new EventSource('/api/stream');
+  evtSource.onmessage = function(e) {
+    const data = JSON.parse(e.data);
+    updateStats(data);
+    fetchLogs();
+  };
+  evtSource.onerror = function() {
+    evtSource.close();
+    setTimeout(connectSSE, 2000);
+  };
+}
+
+$('btnStart').addEventListener('click', function() {
+  this.disabled = true;
+  this.textContent = '⏳ Iniciando...';
+  fetch('/api/start', { method: 'POST' })
+    .then(r => r.json())
+    .then(data => {
+      if (data.status === 'ok') {
+        connectSSE();
+      } else {
+        alert(data.message);
+        this.disabled = false;
+        this.textContent = '▶ Iniciar';
+      }
+    })
+    .catch(() => {
+      this.disabled = false;
+      this.textContent = '▶ Iniciar';
+    });
+});
+
+$('btnRefresh').addEventListener('click', function() {
+  fetch('/api/stats')
+    .then(r => r.json())
+    .then(updateStats);
+  fetchLogs();
+});
+
+fetchLogs();
+</script>
+
+</body>
+</html>
