@@ -4,6 +4,7 @@ outputs/cache/
 outputs/logs/
 outputs/reports/
 outputs/screenshots/
+outputs/tracker.db
 __pycache__/
 *.pyc
 *.mp4

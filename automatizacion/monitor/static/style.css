@@ -57,8 +57,69 @@ main { max-width: 1200px; margin: 0 auto; padding: 2rem; }
 
 .btn-primary { background: #3b82f6; color: white; }
 .btn-primary:hover:not(:disabled) { background: #2563eb; }
+.btn-success { background: #22c55e; color: white; }
+.btn-success:hover:not(:disabled) { background: #16a34a; }
 .btn-secondary { background: #334155; color: #e2e8f0; }
 .btn-secondary:hover { background: #475569; }
+.btn-danger { background: #ef4444; color: white; }
+.btn-danger:hover:not(:disabled) { background: #dc2626; }
+
+.test-mode {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 1.5rem;
+  padding: 0.75rem 1rem;
+  background: #1e293b;
+  border-radius: 8px;
+  border: 1px solid #334155;
+}
+
+.test-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  font-size: 0.95rem;
+  color: #94a3b8;
+}
+
+.test-toggle input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: #3b82f6;
+  cursor: pointer;
+}
+
+.test-controls {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+
+.test-controls label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: #94a3b8;
+}
+
+.input-sm {
+  background: #0f172a;
+  border: 1px solid #475569;
+  color: #e2e8f0;
+  border-radius: 6px;
+  padding: 0.35rem 0.6rem;
+  font-size: 0.85rem;
+  width: 120px;
+}
+
+.input-sm:focus {
+  outline: none;
+  border-color: #3b82f6;
+}
 
 .progress-section { margin-bottom: 2rem; }
 .progress-section h2 { margin-bottom: 0.75rem; font-size: 1.1rem; color: #94a3b8; }
@@ -106,6 +167,32 @@ main { max-width: 1200px; margin: 0 auto; padding: 2rem; }
 .card.failed .card-value { color: #ef4444; }
 .card.skipped .card-value { color: #f59e0b; }
 .card.total .card-value { color: #3b82f6; }
+
+.files-section { margin-bottom: 2rem; }
+.files-section h2 { margin-bottom: 0.75rem; font-size: 1.1rem; color: #94a3b8; }
+
+.files-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.badge {
+  background: #1e293b;
+  color: #94a3b8;
+  padding: 0.4rem 0.75rem;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  border: 1px solid #334155;
+}
+
+.btn-small { padding: 0.4rem 0.75rem; font-size: 0.85rem; }
+.btn-tiny { padding: 0.2rem 0.5rem; font-size: 0.75rem; border-radius: 4px; }
+
+.status-completed { color: #22c55e; }
+.status-processing { color: #3b82f6; }
+.status-pending { color: #f59e0b; }
 
 .steps { margin-bottom: 2rem; }
 .steps h2 { margin-bottom: 0.75rem; font-size: 1.1rem; color: #94a3b8; }

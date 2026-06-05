@@ -11,6 +11,8 @@ ENV = {
     "USERNAME": os.getenv("LOGIN_USERNAME", ""),
     "PASSWORD": os.getenv("LOGIN_PASSWORD", ""),
     "URL": os.getenv("LOGIN_URL", ""),
+    "LOGIN_PATH": "#/login",
+    "CREDITOR_PATH": "#/creditor",
 }
 
 DEFAULT_TIMEOUT = 30000
