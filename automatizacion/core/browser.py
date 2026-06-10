@@ -19,20 +19,25 @@ class BrowserManager:
     def is_running(self) -> bool:
         return self._is_running
 
-    def start(self):
+    def start(self, storage_state: str | None = None, init_script: str | None = None):
         self._is_running = True
         self._playwright = sync_playwright().start()
         self._browser = self._playwright.chromium.launch(
             headless=self.headless,
             args=["--disable-blink-features=AutomationControlled"],
         )
-        self._context = self._browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            locale="es-ES",
-        )
+        ctx_opts = {"viewport": {"width": 1920, "height": 1080}, "locale": "es-ES"}
+        if storage_state:
+            ctx_opts["storage_state"] = storage_state
+        self._context = self._browser.new_context(**ctx_opts)
+        if init_script:
+            self._context.add_init_script(init_script)
         self._page = self._context.new_page()
         self._page.set_default_timeout(DEFAULT_TIMEOUT)
         return self._page
+
+    def save_session(self, store) -> None:
+        store.save(self._context, self._page)
 
     @property
     def page(self) -> Page:

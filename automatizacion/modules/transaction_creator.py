@@ -3,6 +3,7 @@ from playwright.sync_api import Page, expect
 from utils.logger import log
 
 MODAL_TIMEOUT = 10000
+TRANSACTION_REFERENCE = "CIERRE2025"
 
 
 def _wait_for_spinner(page: Page) -> None:
@@ -65,8 +66,7 @@ def create_transaction(page: Page, row_data: dict, row_index: int) -> None:
     dialog = page.get_by_role("dialog")
     expect(dialog.get_by_text("Create Transaction")).to_be_visible(timeout=MODAL_TIMEOUT)
 
-    ref = f"{row_index}_{row_data['Supplier_Code'].strip()}_{row_data['Voucher_Number']}"
-    dialog.locator("input.tpdescription-transactionreference").fill(ref)
+    dialog.locator("input.tpdescription-transactionreference").fill(TRANSACTION_REFERENCE)
 
     voucher = str(row_data["Voucher_Number"])
     dialog.locator("input.tpnumber-vouchernumber").fill(voucher)

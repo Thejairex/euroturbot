@@ -2,13 +2,16 @@ import argparse
 import os
 import sys
 import threading
+from pathlib import Path
 from threading import Event
 
 from core.browser import BrowserManager
+from core.grouping import export_grouped_csv
+from core.session import SessionStore
 from core.stats import StatsTracker
-from core.pipeline import run_pipeline, get_sheet_names
+from core.pipeline import run_pipeline, get_sheet_names, INPUT_DIR
 from data.tracker import ProcessTracker
-from modules.login import do_login, ensure_logged_in
+from modules.login import do_login, is_logged_in
 from config.urls import spa_url
 from utils.logger import log
 
@@ -80,20 +83,36 @@ def _finish(browser: BrowserManager, stats: StatsTracker, error: str | None = No
         _force_exit(stats)
 
 
-def run_automation(stats: StatsTracker, headless: bool = False, test_config: dict | None = None, no_tracker: bool = False):
+def run_automation(stats: StatsTracker, headless: bool = False, test_config: dict | None = None, no_tracker: bool = False, use_session: bool = True):
     stats.start_run()
     browser = BrowserManager(headless=headless)
     tracker = ProcessTracker() if not no_tracker else None
+    store = SessionStore()
 
     try:
         log.info("Iniciando automatización (headless=%s)", headless)
-        page = browser.start()
 
-        do_login(page, stats)
+        if use_session and store.exists():
+            log.info("Restaurando sesión guardada...")
+            page = browser.start(storage_state=store.state_path(), init_script=store.init_script())
+        else:
+            page = browser.start()
 
         log.info("Navegando a creditor...")
         page.goto(spa_url("creditor"))
         page.wait_for_load_state("networkidle")
+
+        if not is_logged_in(page):
+            log.info("Sesión expirada o no existe — haciendo login...")
+            do_login(page, stats)
+            page.goto(spa_url("creditor"))
+            page.wait_for_load_state("networkidle")
+        else:
+            log.info("Sesión activa — sin re-login.")
+
+        if use_session:
+            browser.save_session(store)
+            log.info("Sesión guardada en disco.")
 
         run_pipeline(page, stats, tracker, stop_event=_stop_event, test_config=test_config, no_tracker=no_tracker)
 
@@ -112,20 +131,36 @@ def run_automation(stats: StatsTracker, headless: bool = False, test_config: dic
     _finish(browser, stats)
 
 
-def run_pipeline_only(stats: StatsTracker, headless: bool = False, test_config: dict | None = None, no_tracker: bool = False):
+def run_pipeline_only(stats: StatsTracker, headless: bool = False, test_config: dict | None = None, no_tracker: bool = False, use_session: bool = True):
     stats.start_run()
     browser = BrowserManager(headless=headless)
     tracker = ProcessTracker() if not no_tracker else None
+    store = SessionStore()
 
     try:
         log.info("Iniciando pipeline solo (headless=%s)", headless)
-        page = browser.start()
 
-        ensure_logged_in(page, stats)
+        if use_session and store.exists():
+            log.info("Restaurando sesión guardada...")
+            page = browser.start(storage_state=store.state_path(), init_script=store.init_script())
+        else:
+            page = browser.start()
 
         log.info("Navegando a creditor...")
         page.goto(spa_url("creditor"))
         page.wait_for_load_state("networkidle")
+
+        if not is_logged_in(page):
+            log.info("Sesión expirada o no existe — haciendo login...")
+            do_login(page, stats)
+            page.goto(spa_url("creditor"))
+            page.wait_for_load_state("networkidle")
+        else:
+            log.info("Sesión activa — sin re-login.")
+
+        if use_session:
+            browser.save_session(store)
+            log.info("Sesión guardada en disco.")
 
         run_pipeline(page, stats, tracker, stop_event=_stop_event, test_config=test_config, no_tracker=no_tracker)
 
@@ -169,11 +204,29 @@ def parse_args():
     parser.add_argument("--tracker", type=str, choices=["status", "reset"], help="Gestión del tracker")
     parser.add_argument("--file", type=str, help="Archivo para --tracker reset")
     parser.add_argument("--all", action="store_true", help="Resetear todo el tracker")
+    parser.add_argument("--export-csv", action="store_true", help="Exportar CSV agrupado por proveedor (sin abrir navegador)")
+    parser.add_argument("--fresh-login", action="store_true", help="Ignorar sesión guardada y hacer login desde cero")
+    parser.add_argument("--clear-session", action="store_true", help="Borrar la sesión guardada en disco y salir")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    if args.clear_session:
+        SessionStore().clear()
+        print("Sesión borrada.")
+        sys.exit(0)
+
+    if args.export_csv:
+        filepath = Path(args.file) if args.file else next(iter(sorted(INPUT_DIR.glob("*.xlsx"))), None)
+        if not filepath or not filepath.exists():
+            print("No se encontró archivo .xlsx. Usá --file <ruta>.")
+            sys.exit(1)
+        detail, summary = export_grouped_csv(filepath, args.sheet)
+        print(f"Detalle:  {detail}")
+        print(f"Resumen:  {summary}")
+        sys.exit(0)
 
     if args.tracker:
         tracker = ProcessTracker()
@@ -202,8 +255,13 @@ def main():
         if args.row is not None:
             test_config["row"] = args.row
 
+    use_session = not args.fresh_login
+    if args.fresh_login:
+        SessionStore().clear()
+        log.info("--fresh-login: sesión anterior borrada.")
+
     stats = StatsTracker()
-    run_automation(stats, headless=headless, test_config=test_config, no_tracker=args.no_tracker)
+    run_automation(stats, headless=headless, test_config=test_config, no_tracker=args.no_tracker, use_session=use_session)
 
     sys.exit(1 if stats.error else 0)
 

@@ -33,6 +33,15 @@ def do_login(page: Page, stats: StatsTracker, url: str = "", username: str = "",
         raise LoginError(f"Error en login: {e}") from e
 
 
+def is_logged_in(page: Page) -> bool:
+    """Navega a creditor y verifica si la sesión sigue activa (sin login)."""
+    try:
+        page.wait_for_load_state("networkidle", timeout=10000)
+    except Exception:
+        pass
+    return "login" not in page.url
+
+
 def ensure_logged_in(page: Page, stats: StatsTracker) -> None:
-    if "login" in page.url:
+    if not is_logged_in(page):
         do_login(page, stats)

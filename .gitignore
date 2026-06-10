@@ -11,4 +11,5 @@ __pycache__/
 automatizacion/outputs/tracker.db
 automatizacion/outputs/tracker.db
 automatizacion/outputs/logs/automation.log
+automatizacion/outputs/session/
 Datos 2 TK 813690.xlsx

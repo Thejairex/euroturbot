@@ -5,6 +5,7 @@ from threading import Event
 import pandas as pd
 
 from config.settings import BASE_DIR
+from core.grouping import group_rows_by_supplier
 from data.tracker import ProcessTracker
 from modules.creditor_search import open_supplier
 from modules.supplier_nav import navigate_to_transactions, exit_supplier
@@ -40,6 +41,7 @@ def get_sheet_names(filepath: Path) -> list[str]:
 
 
 def process_row(page, row: dict, row_index: int, filename: str, tracker: ProcessTracker | None, stats):
+    """Procesa un único registro. Se usa cuando el proveedor tiene solo 1 voucher."""
     supplier_code = (row.get("Supplier_Code") or "").strip()
     voucher = row.get("Voucher_Number", "?")
     log.info("  Procesando fila %d: %s (proveedor: %s)", row_index, voucher, supplier_code)
@@ -62,6 +64,58 @@ def process_row(page, row: dict, row_index: int, filename: str, tracker: Process
         if tracker:
             tracker.mark_row_failed(filename, row_index, str(e))
         log.error("  Fila %d FAILED: %s — %s", row_index, voucher, e)
+
+
+def process_supplier_group(page, group: dict, rows: list[dict], filename: str, tracker: ProcessTracker | None, stats):
+    """Procesa todos los vouchers de un proveedor en un solo ciclo de navegación.
+
+    Si el grupo tiene un solo registro delega en process_row (comportamiento original).
+    Si tiene varios, abre el proveedor una vez y repite INSERT→llenar→EXIT modal
+    por cada voucher sin salir del proveedor entre ellos.
+    """
+    supplier_code = group["supplier_code"]
+    records = group["records"]
+
+    if group["size"] == 1:
+        rec = records[0]
+        process_row(page, rows[rec["row_index"]], rec["row_index"], filename, tracker, stats)
+        return
+
+    log.info("  Proveedor %s — %d vouchers (masivo)", supplier_code, group["size"])
+
+    try:
+        open_supplier(page, supplier_code)
+        navigate_to_transactions(page)
+
+        for rec in records:
+            row_index = rec["row_index"]
+            voucher = rec["voucher"]
+
+            if tracker:
+                tracker.mark_row_processing(filename, row_index)
+
+            try:
+                page.get_by_role("button", name="INSERT").click()
+                create_transaction(page, rows[row_index], row_index)
+                page.get_by_role("dialog").get_by_role("button", name="EXIT").click()
+                page.get_by_role("dialog").wait_for(state="hidden", timeout=5000)
+
+                if tracker:
+                    tracker.mark_row_ok(filename, row_index)
+                log.info("    Voucher %s OK (fila %d)", voucher, row_index)
+
+            except Exception as e:
+                if tracker:
+                    tracker.mark_row_failed(filename, row_index, str(e))
+                log.error("    Voucher %s FAILED (fila %d): %s", voucher, row_index, e)
+
+        exit_supplier(page)
+
+    except Exception as e:
+        log.error("  Proveedor %s FAILED: %s", supplier_code, e)
+        for rec in records:
+            if tracker:
+                tracker.mark_row_failed(filename, rec["row_index"], str(e))
 
 
 def run_pipeline(
@@ -131,23 +185,24 @@ def run_pipeline(
                 pending_rows = pending_rows[:1]
 
         total = len(pending_rows)
+        pending_indices = [r["row_index"] for r in pending_rows]
+        groups = group_rows_by_supplier(rows, pending_indices)
 
-        for i, db_row in enumerate(pending_rows, 1):
+        for i, group in enumerate(groups, 1):
             if stop_event and stop_event.is_set():
                 log.info("Detenido por usuario durante el procesamiento")
                 break
 
-            row_index = db_row["row_index"]
-            data_row = rows[row_index]
-            step = stats.add_step(f"Fila {row_index}: {data_row.get('Voucher_Number', '?')}")
+            label = f"Proveedor {group['supplier_code']} ({group['size']} voucher{'s' if group['size'] > 1 else ''})"
+            step = stats.add_step(label)
             stats.mark_running(step)
             try:
-                process_row(page, data_row, row_index, filename, tracker, stats)
+                process_supplier_group(page, group, rows, filename, tracker, stats)
                 stats.mark_ok(step)
             except Exception as e:
                 stats.mark_failed(step, str(e))
 
-            log.info("  Progreso archivo: %d/%d", i, total)
+            log.info("  Progreso archivo: %d/%d proveedores", i, len(groups))
 
         moved = PROCESSED_DIR / filename
         shutil.move(str(filepath), str(moved))
