@@ -118,12 +118,12 @@ class ProcessTracker:
     def init_rows(self, filename: str, rows: list[dict[str, Any]]):
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         data = [
-            (filename, i, r.get("Booking_Reference", ""), "pending", None, now)
+            (filename, i, r.get("Voucher_Number", ""), "pending", None, now)
             for i, r in enumerate(rows)
         ]
         self._conn.executemany(
             "INSERT OR IGNORE INTO processed_rows (filename, row_index, booking_reference, status, error, processed_at) "
-            "VALUES (?, ?, ?, 'pending', NULL, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?)",
             data,
         )
         self._conn.commit()

@@ -1,6 +1,6 @@
 import time
 import json
-from threading import Lock
+from threading import RLock
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,7 +26,7 @@ class StatsTracker:
     def __init__(self):
         self._steps: list[StepStats] = []
         self._started_at: float | None = None
-        self._lock = Lock()
+        self._lock = RLock()
         self._finished = False
         self._error: str | None = None
 

@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 import threading
 from threading import Event
@@ -10,6 +11,7 @@ from data.tracker import ProcessTracker
 from modules.login import do_login, ensure_logged_in
 from config.urls import spa_url
 from utils.logger import log
+
 
 _stop_event: Event | None = None
 
@@ -33,10 +35,55 @@ def reset_stop():
         _stop_event.clear()
 
 
-def run_automation(stats: StatsTracker, headless: bool = False, test_config: dict | None = None):
+def _cleanup(stats: StatsTracker, browser: BrowserManager, error: str | None = None):
+    if error:
+        stats.error = error
+        stats.finished = True
+        try:
+            browser.screenshot("error_fatal")
+        except Exception:
+            pass
+    else:
+        stats.finished = True
+    try:
+        stats.save_report("report")
+    except Exception:
+        pass
+
+
+def _close_browser(browser: BrowserManager):
+    log.info("Cerrando navegador...")
+    try:
+        browser.close()
+    except Exception:
+        pass
+    log.info("Navegador cerrado.")
+
+
+def _force_exit(stats: StatsTracker, code: int | None = None):
+    if code is None:
+        code = 1 if stats.error else 0
+    log.info("Saliendo con código %d", code)
+    for h in log.handlers:
+        h.flush()
+    import logging
+    logging.shutdown()
+    os._exit(code)
+
+
+def _finish(browser: BrowserManager, stats: StatsTracker, error: str | None = None):
+    _cleanup(stats, browser, error)
+    t = threading.Thread(target=_close_browser, args=(browser,), daemon=True)
+    t.start()
+    t.join(timeout=15)
+    if threading.current_thread() is threading.main_thread():
+        _force_exit(stats)
+
+
+def run_automation(stats: StatsTracker, headless: bool = False, test_config: dict | None = None, no_tracker: bool = False):
     stats.start_run()
     browser = BrowserManager(headless=headless)
-    tracker = ProcessTracker()
+    tracker = ProcessTracker() if not no_tracker else None
 
     try:
         log.info("Iniciando automatización (headless=%s)", headless)
@@ -48,27 +95,27 @@ def run_automation(stats: StatsTracker, headless: bool = False, test_config: dic
         page.goto(spa_url("creditor"))
         page.wait_for_load_state("networkidle")
 
-        run_pipeline(page, stats, tracker, stop_event=_stop_event, test_config=test_config)
+        run_pipeline(page, stats, tracker, stop_event=_stop_event, test_config=test_config, no_tracker=no_tracker)
 
-        stats.finished = True
-        stats.save_report("report")
         log.info("Automatización completada. Progreso: %s%%", stats.progress)
+
+    except KeyboardInterrupt:
+        log.info("Interrupción por teclado")
+        _finish(browser, stats, "Interrumpido por el usuario")
+        return
 
     except Exception as e:
         log.error("Error fatal: %s", e)
-        stats.error = str(e)
-        stats.finished = True
-        if hasattr(browser, "screenshot"):
-            browser.screenshot("error_fatal")
-        stats.save_report("report")
-    finally:
-        browser.close()
+        _finish(browser, stats, str(e))
+        return
+
+    _finish(browser, stats)
 
 
-def run_pipeline_only(stats: StatsTracker, headless: bool = False, test_config: dict | None = None):
+def run_pipeline_only(stats: StatsTracker, headless: bool = False, test_config: dict | None = None, no_tracker: bool = False):
     stats.start_run()
     browser = BrowserManager(headless=headless)
-    tracker = ProcessTracker()
+    tracker = ProcessTracker() if not no_tracker else None
 
     try:
         log.info("Iniciando pipeline solo (headless=%s)", headless)
@@ -80,22 +127,21 @@ def run_pipeline_only(stats: StatsTracker, headless: bool = False, test_config: 
         page.goto(spa_url("creditor"))
         page.wait_for_load_state("networkidle")
 
-        run_pipeline(page, stats, tracker, stop_event=_stop_event, test_config=test_config)
+        run_pipeline(page, stats, tracker, stop_event=_stop_event, test_config=test_config, no_tracker=no_tracker)
 
-        stats.finished = True
-        stats.save_report("report")
         log.info("Pipeline completado. Progreso: %s%%", stats.progress)
+
+    except KeyboardInterrupt:
+        log.info("Interrupción por teclado")
+        _finish(browser, stats, "Interrumpido por el usuario")
+        return
 
     except Exception as e:
         log.error("Error fatal: %s", e)
-        stats.error = str(e)
-        stats.finished = True
-        if hasattr(browser, "screenshot"):
-            browser.screenshot("error_fatal")
-        stats.save_report("report")
-    finally:
-        browser.close()
+        _finish(browser, stats, str(e))
+        return
 
+    _finish(browser, stats)
 
 def run_automation_thread(stats: StatsTracker, headless: bool = False, test_config: dict | None = None):
     reset_stop()
@@ -118,7 +164,8 @@ def parse_args():
     parser.add_argument("--report", type=str, default="report", help="Nombre del archivo de reporte")
     parser.add_argument("--test", action="store_true", help="Modo prueba: solo 1 registro")
     parser.add_argument("--row", type=int, help="Fila específica a procesar (0-indexed)")
-    parser.add_argument("--sheet", type=str, default="SI TRANS", help="Nombre de la hoja (default: SI TRANS)")
+    parser.add_argument("--sheet", type=str, default=None, help="Nombre de la hoja (default: auto-detect)")
+    parser.add_argument("--no-tracker", action="store_true", help="Desactivar tracker (procesa siempre)")
     parser.add_argument("--tracker", type=str, choices=["status", "reset"], help="Gestión del tracker")
     parser.add_argument("--file", type=str, help="Archivo para --tracker reset")
     parser.add_argument("--all", action="store_true", help="Resetear todo el tracker")
@@ -144,20 +191,21 @@ def main():
         return
 
     headless = args.headless
-    if not headless and not args.visible:
-        headless = True
+    if args.visible:
+        headless = False
 
     test_config = None
     if args.test:
-        test_config = {"test": True, "sheet": args.sheet}
+        test_config = {"test": True}
+        if args.sheet is not None:
+            test_config["sheet"] = args.sheet
         if args.row is not None:
             test_config["row"] = args.row
 
     stats = StatsTracker()
-    run_automation(stats, headless=headless, test_config=test_config)
+    run_automation(stats, headless=headless, test_config=test_config, no_tracker=args.no_tracker)
 
-    if stats.error:
-        sys.exit(1)
+    sys.exit(1 if stats.error else 0)
 
 
 def _show_status(tracker: ProcessTracker):
