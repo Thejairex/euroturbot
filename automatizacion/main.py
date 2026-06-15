@@ -207,6 +207,7 @@ def parse_args():
     parser.add_argument("--export-csv", action="store_true", help="Exportar CSV agrupado por proveedor (sin abrir navegador)")
     parser.add_argument("--fresh-login", action="store_true", help="Ignorar sesión guardada y hacer login desde cero")
     parser.add_argument("--clear-session", action="store_true", help="Borrar la sesión guardada en disco y salir")
+    parser.add_argument("--supplier", type=str, help="Procesar solo el proveedor con este Supplier_Code (para testing masivo)")
     return parser.parse_args()
 
 
@@ -254,6 +255,8 @@ def main():
             test_config["sheet"] = args.sheet
         if args.row is not None:
             test_config["row"] = args.row
+        if args.supplier is not None:
+            test_config["supplier"] = args.supplier
 
     use_session = not args.fresh_login
     if args.fresh_login:
