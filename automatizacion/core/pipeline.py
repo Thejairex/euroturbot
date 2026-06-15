@@ -16,6 +16,7 @@ from modules.transaction_creator import (
     add_voucher_line,
     exit_invoice_line,
     read_invoice_totals,
+    save_invoice,
     abort_transaction,
     InvalidAccountError,
 )
@@ -177,21 +178,16 @@ def process_supplier_group(page, group: dict, rows: list[dict], filename: str, t
                     log.warning("    %d/%d vouchers cargados (saltados por cuenta inválida: %s)",
                                 loaded_count, len(vouchers_for_currency), skipped_vouchers)
 
+                # Política: guardar siempre que haya al menos 1 voucher cargado,
+                # sin importar el REMAINDER (TourplanNX lo permite). La diferencia
+                # queda registrada en el invoice para revisión posterior.
                 if remainder < 0.01:
-                    log.info("    LISTO PARA GUARDAR: %s %s — REMAINDER=%.2f (totales cuadran)",
-                             supplier_code, currency, remainder)
-                    abort_transaction(page)
+                    log.info("    Totales cuadran: %s %s — REMAINDER=%.2f", supplier_code, currency, remainder)
                 else:
-                    diff = totals.get("remainder", "?")
-                    if skipped_vouchers:
-                        log.warning("    REMAINDER=%.4f — diferencia esperada por vouchers saltados: %s",
-                                    diff, skipped_vouchers)
-                    else:
-                        log.error("    Totales NO cuadran: %s %s — REMAINDER=%.4f (esperado 0)",
-                                  supplier_code, currency, diff)
-                    abort_transaction(page)
-                    group_ok = False
-                    group_error = f"REMAINDER={diff} para moneda {currency}"
+                    log.warning("    REMAINDER=%.4f para %s %s — guardando igual (discrepancia/salteados)",
+                                totals.get("remainder", "?"), supplier_code, currency)
+
+                save_invoice(page)
 
         exit_supplier(page)
 

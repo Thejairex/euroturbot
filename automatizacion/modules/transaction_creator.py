@@ -6,6 +6,7 @@ MODAL_TIMEOUT = 10000
 EXPECTED_TOTAL_SELECTOR = "input.tpnumber-invoices"
 VOUCHER_LINE_OK = "button.tpok.tpprimarysystembutton"
 INVOICE_INSERT = "button.tpinsert"
+INVOICE_SAVE = "button.tpsave"
 ACCOUNT_SELECTOR = "input.tpcode.tpcode6.tpuppercase"
 VOUCHER_INPUT = "input.tpnumber-vouchernumber:not(.tpreadonly)"
 
@@ -198,7 +199,7 @@ def read_invoice_totals(page: Page) -> dict:
     """Lee INVOICE TOTAL, EXPECTED TOTAL y REMAINDER del Insert Invoice.
 
     Los 4 totales comparten la clase tpnumber-invoices tpreadonly en este orden:
-    [0]=EXPECTED TOTAL, [1]=TAX AMOUNT, [2]=INVOICE TOTAL, [3]=REMAINDER
+    [0]=INVOICE TOTAL, [1]=TAX AMOUNT, [2]=EXPECTED TOTAL, [3]=REMAINDER
 
     Returns:
         {"invoice_total": float, "expected_total": float, "remainder": float}
@@ -210,8 +211,8 @@ def read_invoice_totals(page: Page) -> dict:
             );
             const clean = v => parseFloat((v || '0').replace(/,/g, '')) || 0;
             return {
-                expected_total: clean(inputs[0] ? inputs[0].value : null),
-                invoice_total:  clean(inputs[2] ? inputs[2].value : null),
+                invoice_total:  clean(inputs[0] ? inputs[0].value : null),
+                expected_total: clean(inputs[2] ? inputs[2].value : null),
                 remainder:      clean(inputs[3] ? inputs[3].value : null),
             };
         }
@@ -221,6 +222,43 @@ def read_invoice_totals(page: Page) -> dict:
              parsed.get("expected_total", 0),
              parsed.get("remainder", 0))
     return parsed
+
+
+def save_invoice(page: Page) -> None:
+    """Guarda el invoice (Insert Invoice) clickeando SAVE.
+
+    Funciona aunque el REMAINDER no sea 0 (TourplanNX lo permite). Cuando el
+    REMAINDER != 0, TourplanNX abre un diálogo "Warning, Invoice total mismatch"
+    con botones NO/YES; se confirma con YES.
+    """
+    dialogs_before = page.get_by_role("dialog").count()
+    dialog = page.get_by_role("dialog").last
+    save_btn = dialog.locator(INVOICE_SAVE)
+    save_btn.wait_for(state="visible", timeout=MODAL_TIMEOUT)
+    save_btn.click(force=True)
+    page.wait_for_timeout(1000)
+
+    # Si el invoice no cuadra, aparece el diálogo de confirmación. Click YES.
+    try:
+        warning = page.get_by_role("dialog").filter(has_text="Invoice total mismatch")
+        if warning.count() > 0:
+            warning.last.get_by_role("button", name="YES").click()
+            log.info("    Warning de descuadre confirmado (YES)")
+            page.wait_for_timeout(800)
+    except Exception:
+        pass
+
+    _wait_for_spinner(page)
+    page.wait_for_timeout(1000)
+
+    # Verificar que el modal Insert Invoice se cerró (guardado efectivo). Si sigue
+    # abierto, algún diálogo no se manejó — abortar para no colgar el exit_supplier.
+    dialogs_after = page.get_by_role("dialog").count()
+    if dialogs_after >= dialogs_before:
+        raise RuntimeError(
+            "El modal de invoice sigue abierto tras SAVE — posible diálogo no manejado"
+        )
+    log.info("    Invoice guardado (SAVE)")
 
 
 def exit_invoice_line(page: Page) -> None:
