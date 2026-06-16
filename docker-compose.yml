@@ -1,32 +1,22 @@
 services:
-  monitor:
-    build: .
-    restart: unless-stopped
+  euroturbot:
+    build:
+      context: ./automatizacion
+      dockerfile: Dockerfile
+
+    container_name: euroturbot-monitor
+
     ports:
-      - "8000:8000"
+      - "8500:8000"
 
-    # Las credenciales (LOGIN_USERNAME, LOGIN_PASSWORD, LOGIN_URL)
-    # se leen del archivo .env en automatizacion/.env del host.
-    # El código hace load_dotenv(BASE_DIR / ".env"), así que el archivo
-    # se monta en la ruta exacta que espera la aplicación.
+    env_file:
+      - ./automatizacion/.env
+
     volumes:
-      # Credenciales (solo lectura)
-      - ./automatizacion/.env:/app/automatizacion/.env:ro
-
-      # Datos que persisten entre reinicios del contenedor
       - ./automatizacion/input:/app/automatizacion/input
       - ./automatizacion/processed:/app/automatizacion/processed
       - ./automatizacion/outputs:/app/automatizacion/outputs
 
-    # Chromium necesita /dev/shm amplio para no crashear en modo headless
     shm_size: "256mb"
 
-    environment:
-      # Fuerza modo headless dentro del contenedor (no hay display)
-      - DISPLAY=
-
-    # Límite de memoria opcional — Chromium puede usar bastante
-    # deploy:
-    #   resources:
-    #     limits:
-    #       memory: 2g
+    restart: unless-stopped

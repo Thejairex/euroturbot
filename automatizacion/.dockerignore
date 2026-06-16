@@ -1,0 +1,18 @@
+venv/
+.venv/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Credenciales (se pasan via env_file, no se copian en la imagen)
+.env
+
+# Datos de ejecución (montados como volúmenes)
+input/
+processed/
+outputs/
+
+.git/
+.vscode/
+.idea/
+Dockerfile
