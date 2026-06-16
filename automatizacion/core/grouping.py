@@ -167,6 +167,35 @@ def export_grouped_csv(filepath: Path, sheet_name: str | None = None) -> tuple[P
     return detail_path, summary_path
 
 
+def write_oversized_report(oversized: list[dict]) -> Path | None:
+    """Escribe un CSV con los proveedores saltados por superar el umbral de vouchers.
+
+    Cada entrada debe tener:
+        filename, supplier_code, supplier_name, voucher_count, currencies, totals
+    """
+    if not oversized:
+        return None
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = REPORT_DIR / f"proveedores_grandes_{stamp}.csv"
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Archivo", "Supplier_Code", "Supplier_Name",
+            "voucher_count", "currencies", "totales_por_moneda",
+        ])
+        for o in oversized:
+            writer.writerow([
+                o.get("filename", ""),
+                o.get("supplier_code", ""),
+                o.get("supplier_name", ""),
+                o.get("voucher_count", ""),
+                o.get("currencies", ""),
+                o.get("totals", ""),
+            ])
+    return path
+
+
 def write_skipped_report(skipped: list[dict]) -> Path | None:
     """Escribe un CSV con los vouchers salteados por cuenta inválida.
 

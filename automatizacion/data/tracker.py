@@ -35,6 +35,8 @@ class ProcessTracker:
                 filename TEXT NOT NULL,
                 row_index INTEGER NOT NULL,
                 booking_reference TEXT,
+                supplier_code TEXT,
+                currency TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
                 error TEXT,
                 processed_at TEXT,
@@ -43,6 +45,11 @@ class ProcessTracker:
 
             CREATE INDEX IF NOT EXISTS idx_rows_status ON processed_rows(filename, status);
         """)
+        # Migración para BDs existentes: agregar columnas nuevas si faltan
+        existing = {r["name"] for r in self._conn.execute("PRAGMA table_info(processed_rows)")}
+        for col in ("supplier_code", "currency"):
+            if col not in existing:
+                self._conn.execute(f"ALTER TABLE processed_rows ADD COLUMN {col} TEXT")
         self._conn.commit()
 
     @staticmethod
@@ -118,12 +125,19 @@ class ProcessTracker:
     def init_rows(self, filename: str, rows: list[dict[str, Any]]):
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         data = [
-            (filename, i, r.get("Voucher_Number", ""), "pending", None, now)
+            (
+                filename, i,
+                r.get("Voucher_Number", ""),
+                (r.get("Supplier_Code") or "").strip(),
+                (r.get("Service_Cost_Currency") or "").strip(),
+                "pending", None, now,
+            )
             for i, r in enumerate(rows)
         ]
         self._conn.executemany(
-            "INSERT OR IGNORE INTO processed_rows (filename, row_index, booking_reference, status, error, processed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO processed_rows "
+            "(filename, row_index, booking_reference, supplier_code, currency, status, error, processed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             data,
         )
         self._conn.commit()
@@ -161,6 +175,14 @@ class ProcessTracker:
         self._conn.execute(
             "UPDATE processed_rows SET status = 'skipped', processed_at = ? WHERE filename = ? AND row_index = ?",
             (time.strftime("%Y-%m-%d %H:%M:%S"), filename, row_index),
+        )
+        self._conn.commit()
+
+    def mark_row_pending(self, filename: str, row_index: int):
+        """Vuelve una fila a 'pending' (para reintento tras abortar un grupo)."""
+        self._conn.execute(
+            "UPDATE processed_rows SET status = 'pending', error = NULL WHERE filename = ? AND row_index = ?",
+            (filename, row_index),
         )
         self._conn.commit()
 

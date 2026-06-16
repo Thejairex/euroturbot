@@ -1,4 +1,5 @@
 import os
+import threading
 from pathlib import Path
 from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page
 
@@ -14,6 +15,8 @@ class BrowserManager:
         self.headless = headless
         self._screenshot_counter = 0
         self._is_running = False
+        self._close_lock = threading.Lock()
+        self._closed = False
 
     @property
     def is_running(self) -> bool:
@@ -21,6 +24,7 @@ class BrowserManager:
 
     def start(self, storage_state: str | None = None, init_script: str | None = None):
         self._is_running = True
+        self._closed = False
         self._playwright = sync_playwright().start()
         self._browser = self._playwright.chromium.launch(
             headless=self.headless,
@@ -60,10 +64,20 @@ class BrowserManager:
         return path
 
     def close(self):
-        self._is_running = False
-        if self._context:
-            self._context.close()
-        if self._browser:
-            self._browser.close()
-        if self._playwright:
-            self._playwright.stop()
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._is_running = False
+        for closer in (
+            lambda: self._context.close() if self._context else None,
+            lambda: self._browser.close() if self._browser else None,
+            lambda: self._playwright.stop() if self._playwright else None,
+        ):
+            try:
+                closer()
+            except Exception:
+                pass
+
+    # Alias semántico: se llama desde otro thread para desbloquear al worker Playwright
+    force_close = close

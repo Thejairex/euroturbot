@@ -8,7 +8,7 @@ from threading import Event
 from core.browser import BrowserManager
 from core.grouping import export_grouped_csv
 from core.session import SessionStore
-from core.stats import StatsTracker
+from core.stats import StatsTracker, StatsEventHandler
 from core.pipeline import run_pipeline, get_sheet_names, INPUT_DIR
 from data.tracker import ProcessTracker
 from modules.login import do_login, is_logged_in
@@ -83,9 +83,20 @@ def _finish(browser: BrowserManager, stats: StatsTracker, error: str | None = No
         _force_exit(stats)
 
 
-def run_automation(stats: StatsTracker, headless: bool = False, test_config: dict | None = None, no_tracker: bool = False, use_session: bool = True, limit: int | None = None):
+def run_automation(
+    stats: StatsTracker,
+    headless: bool = False,
+    test_config: dict | None = None,
+    no_tracker: bool = False,
+    use_session: bool = True,
+    limit: int | None = None,
+    max_vouchers: int | None = None,
+    _browser: BrowserManager | None = None,
+    _stop_event: Event | None = None,
+):
     stats.start_run()
-    browser = BrowserManager(headless=headless)
+    browser = _browser if _browser is not None else BrowserManager(headless=headless)
+    stop_event = _stop_event if _stop_event is not None else _make_stop()
     tracker = ProcessTracker() if not no_tracker else None
     store = SessionStore()
 
@@ -114,7 +125,7 @@ def run_automation(stats: StatsTracker, headless: bool = False, test_config: dic
             browser.save_session(store)
             log.info("Sesión guardada en disco.")
 
-        run_pipeline(page, stats, tracker, stop_event=_stop_event, test_config=test_config, no_tracker=no_tracker, limit=limit)
+        run_pipeline(page, stats, tracker, stop_event=stop_event, test_config=test_config, no_tracker=no_tracker, limit=limit, max_vouchers=max_vouchers)
 
         log.info("Automatización completada. Progreso: %s%%", stats.progress)
 
@@ -131,9 +142,18 @@ def run_automation(stats: StatsTracker, headless: bool = False, test_config: dic
     _finish(browser, stats)
 
 
-def run_pipeline_only(stats: StatsTracker, headless: bool = False, test_config: dict | None = None, no_tracker: bool = False, use_session: bool = True):
+def run_pipeline_only(
+    stats: StatsTracker,
+    headless: bool = False,
+    test_config: dict | None = None,
+    no_tracker: bool = False,
+    use_session: bool = True,
+    _browser: BrowserManager | None = None,
+    _stop_event: Event | None = None,
+):
     stats.start_run()
-    browser = BrowserManager(headless=headless)
+    browser = _browser if _browser is not None else BrowserManager(headless=headless)
+    stop_event = _stop_event if _stop_event is not None else _make_stop()
     tracker = ProcessTracker() if not no_tracker else None
     store = SessionStore()
 
@@ -162,7 +182,7 @@ def run_pipeline_only(stats: StatsTracker, headless: bool = False, test_config: 
             browser.save_session(store)
             log.info("Sesión guardada en disco.")
 
-        run_pipeline(page, stats, tracker, stop_event=_stop_event, test_config=test_config, no_tracker=no_tracker)
+        run_pipeline(page, stats, tracker, stop_event=stop_event, test_config=test_config, no_tracker=no_tracker)
 
         log.info("Pipeline completado. Progreso: %s%%", stats.progress)
 
@@ -177,6 +197,144 @@ def run_pipeline_only(stats: StatsTracker, headless: bool = False, test_config: 
         return
 
     _finish(browser, stats)
+
+
+class RunManager:
+    """Dueño del ciclo de vida de cada run: thread, stats, browser y stop_event."""
+
+    HUNG_AFTER = 120.0  # segundos sin heartbeat con thread vivo → estado "hung"
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._stats: StatsTracker | None = None
+        self._browser: BrowserManager | None = None
+        self._run_stop_event: Event | None = None
+        self._mode: str | None = None
+        log.addHandler(StatsEventHandler(lambda: self._stats))
+
+    @property
+    def stats(self) -> StatsTracker | None:
+        return self._stats
+
+    def start(
+        self,
+        mode: str,
+        *,
+        headless: bool = True,
+        test_config: dict | None = None,
+        no_tracker: bool = False,
+    ) -> tuple[bool, str]:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return False, "Ya hay una automatización en ejecución"
+
+            stop_ev = Event()
+            stats = StatsTracker()
+            browser = BrowserManager(headless=headless)
+
+            target = run_automation if mode == "full" else run_pipeline_only
+            t = threading.Thread(
+                target=target,
+                kwargs={
+                    "stats": stats,
+                    "headless": headless,
+                    "test_config": test_config,
+                    "no_tracker": no_tracker,
+                    "_browser": browser,
+                    "_stop_event": stop_ev,
+                },
+                daemon=True,
+            )
+
+            self._thread = t
+            self._stats = stats
+            self._browser = browser
+            self._run_stop_event = stop_ev
+            self._mode = mode
+
+            t.start()
+            log.info("RunManager: run '%s' iniciado (headless=%s)", mode, headless)
+            return True, f"{'Automatización' if mode == 'full' else 'Pipeline'} iniciado"
+
+    def stop(self) -> tuple[bool, str]:
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive():
+                return False, "No hay ninguna automatización en ejecución"
+            if self._run_stop_event:
+                self._run_stop_event.set()
+            log.info("RunManager: señal de detención enviada")
+            return True, "Deteniendo... el pipeline se detendrá al finalizar el grupo actual"
+
+    def force_stop(self) -> tuple[bool, str]:
+        """Para forzado: cierra el navegador para desbloquear al worker Playwright.
+        BLOQUEANTE (hasta ~15s). Llamar siempre desde un thread plano, nunca desde asyncio."""
+        with self._lock:
+            browser = self._browser
+            stop_ev = self._run_stop_event
+            thread = self._thread
+
+        if thread is None or not thread.is_alive():
+            return False, "No hay ninguna automatización en ejecución"
+
+        if stop_ev:
+            stop_ev.set()
+
+        if browser:
+            close_t = threading.Thread(target=browser.force_close, daemon=True)
+            close_t.start()
+            close_t.join(timeout=10)
+
+        if thread:
+            thread.join(timeout=8)
+
+        alive = thread.is_alive() if thread else False
+        if alive:
+            return False, "El thread sigue vivo tras el cierre forzado — puede necesitar reiniciar uvicorn"
+        return True, "Detención forzada completada"
+
+    def state(self) -> str:
+        thread = self._thread
+        stats = self._stats
+        stop_ev = self._run_stop_event
+
+        if thread is None:
+            return "idle"
+
+        alive = thread.is_alive()
+
+        if not alive:
+            if stats and stats.error:
+                return "error"
+            return "finished" if stats and stats.finished else "idle"
+
+        if stop_ev and stop_ev.is_set():
+            return "stopping"
+
+        if stats:
+            age = stats.last_activity_age
+            if age is not None and age > self.HUNG_AFTER:
+                return "hung"
+
+        return "running"
+
+    def snapshot(self) -> dict:
+        thread = self._thread
+        stats = self._stats
+        return {
+            "state": self.state(),
+            "mode": self._mode,
+            "thread_alive": thread.is_alive() if thread else False,
+            "heartbeat_age": stats.last_activity_age if stats else None,
+            "stats": stats.results if stats else None,
+        }
+
+
+# Singleton compartido entre main.py y monitor/app.py
+run_manager = RunManager()
+
+
+# ── Wrappers de compatibilidad ────────────────────────────────────────────────
 
 def run_automation_thread(stats: StatsTracker, headless: bool = False, test_config: dict | None = None):
     reset_stop()
@@ -209,6 +367,7 @@ def parse_args():
     parser.add_argument("--clear-session", action="store_true", help="Borrar la sesión guardada en disco y salir")
     parser.add_argument("--supplier", type=str, help="Procesar solo el proveedor con este Supplier_Code (para testing masivo)")
     parser.add_argument("--limit", type=int, default=None, help="Procesar como máximo N proveedores pendientes por corrida (modo lote)")
+    parser.add_argument("--max-vouchers", type=int, default=None, help="Saltar proveedores con más de N vouchers (default: settings; <=0 sin límite)")
     return parser.parse_args()
 
 
@@ -265,7 +424,7 @@ def main():
         log.info("--fresh-login: sesión anterior borrada.")
 
     stats = StatsTracker()
-    run_automation(stats, headless=headless, test_config=test_config, no_tracker=args.no_tracker, use_session=use_session, limit=args.limit)
+    run_automation(stats, headless=headless, test_config=test_config, no_tracker=args.no_tracker, use_session=use_session, limit=args.limit, max_vouchers=args.max_vouchers)
 
     sys.exit(1 if stats.error else 0)
 

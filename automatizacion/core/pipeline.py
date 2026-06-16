@@ -4,8 +4,8 @@ from threading import Event
 
 import pandas as pd
 
-from config.settings import BASE_DIR
-from core.grouping import group_rows_by_supplier, write_skipped_report
+from config.settings import BASE_DIR, MAX_VOUCHERS_PER_SUPPLIER
+from core.grouping import group_rows_by_supplier, write_skipped_report, write_oversized_report
 from data.tracker import ProcessTracker
 from modules.creditor_search import open_supplier
 from modules.supplier_nav import navigate_to_transactions, exit_supplier
@@ -25,6 +25,11 @@ from utils.logger import log
 
 INPUT_DIR = BASE_DIR / "input"
 PROCESSED_DIR = BASE_DIR / "processed"
+
+
+class PipelineStopped(Exception):
+    """Excepción interna para señal de stop cooperativo dentro de un grupo."""
+    pass
 
 
 def get_data_rows(filepath: Path, sheet_name: str | None = None) -> list[dict]:
@@ -64,11 +69,16 @@ def get_sheet_names(filepath: Path) -> list[str]:
     return [s for s in sheets if s not in ("Sheet2",)]
 
 
-def process_row(page, row: dict, row_index: int, filename: str, tracker: ProcessTracker | None, stats):
+def process_row(page, row: dict, row_index: int, filename: str, tracker: ProcessTracker | None, stats, stop_event: Event | None = None):
     """Procesa un único registro. Se usa cuando el proveedor tiene solo 1 voucher."""
     supplier_code = (row.get("Supplier_Code") or "").strip()
     voucher = row.get("Voucher_Number", "?")
+
+    if stop_event and stop_event.is_set():
+        raise PipelineStopped()
+
     log.info("  Procesando fila %d: %s (proveedor: %s)", row_index, voucher, supplier_code)
+    stats.set_activity(supplier=supplier_code, currency=row.get("Service_Cost_Currency", ""), voucher=voucher, voucher_idx=1, voucher_total=1)
 
     if tracker:
         tracker.mark_row_processing(filename, row_index)
@@ -83,25 +93,40 @@ def process_row(page, row: dict, row_index: int, filename: str, tracker: Process
         exit_supplier(page)
         if tracker:
             tracker.mark_row_ok(filename, row_index)
+        stats.add_voucher_result({
+            "filename": filename, "supplier_code": supplier_code,
+            "voucher": str(voucher), "currency": row.get("Service_Cost_Currency", ""),
+            "status": "ok", "error": None, "row_index": row_index,
+        })
         log.info("  Fila %d OK: %s", row_index, voucher)
     except Exception as e:
         if tracker:
             tracker.mark_row_failed(filename, row_index, str(e))
+        stats.add_voucher_result({
+            "filename": filename, "supplier_code": supplier_code,
+            "voucher": str(voucher), "currency": row.get("Service_Cost_Currency", ""),
+            "status": "failed", "error": str(e), "row_index": row_index,
+        })
         log.error("  Fila %d FAILED: %s — %s", row_index, voucher, e)
 
 
-def process_supplier_group(page, group: dict, rows: list[dict], filename: str, tracker: ProcessTracker | None, stats, skipped_report: list | None = None):
-    """Procesa todos los vouchers de un proveedor en un solo ciclo de navegación.
-
-    Si el grupo tiene un solo registro delega en process_row (comportamiento original).
-    Si tiene varios, abre el proveedor una vez y repite INSERT→llenar→EXIT modal
-    por cada voucher sin salir del proveedor entre ellos.
-    """
+def process_supplier_group(
+    page,
+    group: dict,
+    rows: list[dict],
+    filename: str,
+    tracker: ProcessTracker | None,
+    stats,
+    skipped_report: list | None = None,
+    stop_event: Event | None = None,
+    max_vouchers: int | None = None,
+    oversized_report: list | None = None,
+):
+    """Procesa todos los vouchers de un proveedor en un solo ciclo de navegación."""
     supplier_code = group["supplier_code"]
     records = group["records"]
 
-    # Marcar las filas MEP como 'skipped' (no procesables) para que no queden
-    # pendientes eternamente y el archivo pueda completarse.
+    # Marcar las filas MEP como 'skipped'
     skipped_mep = group.get("skipped_mep", [])
     if skipped_mep:
         log.info("  Proveedor %s — %d registros MEP ignorados (filas: %s)",
@@ -110,9 +135,30 @@ def process_supplier_group(page, group: dict, rows: list[dict], filename: str, t
             for idx in skipped_mep:
                 tracker.mark_row_skipped(filename, idx)
 
+    # Proveedores grandes: superan el umbral de vouchers → saltar y reportar
+    # (entidades internas tipo 1EURO1/1ING01, inviables de cargar por UI).
+    if max_vouchers and max_vouchers > 0 and group["size"] > max_vouchers:
+        currencies = ", ".join(group["total_by_currency"].keys())
+        totals = "; ".join(f"{c}={t:.2f}" for c, t in group["total_by_currency"].items())
+        log.warning("  Proveedor %s SALTADO: %d vouchers > umbral %d — para revisión manual",
+                    supplier_code, group["size"], max_vouchers)
+        if tracker:
+            for rec in records:
+                tracker.mark_row_skipped(filename, rec["row_index"])
+        if oversized_report is not None:
+            oversized_report.append({
+                "filename": filename,
+                "supplier_code": supplier_code,
+                "supplier_name": group.get("supplier_name", ""),
+                "voucher_count": group["size"],
+                "currencies": currencies,
+                "totals": totals,
+            })
+        return
+
     if group["size"] == 1:
         rec = records[0]
-        process_row(page, rows[rec["row_index"]], rec["row_index"], filename, tracker, stats)
+        process_row(page, rows[rec["row_index"]], rec["row_index"], filename, tracker, stats, stop_event=stop_event)
         return
 
     if not group["total_by_currency"]:
@@ -122,6 +168,8 @@ def process_supplier_group(page, group: dict, rows: list[dict], filename: str, t
     log.info("  Proveedor %s — %d registros, masivo por moneda: %s",
              supplier_code, group["size"],
              ", ".join(f"{c}={t:.2f}" for c, t in group["total_by_currency"].items()))
+
+    stats.set_activity(supplier=supplier_code, supplier_name=group.get("supplier_name", ""))
 
     all_indices = [rec["row_index"] for rec in records]
 
@@ -137,11 +185,21 @@ def process_supplier_group(page, group: dict, rows: list[dict], filename: str, t
         navigate_to_transactions(page)
 
         for currency, total in group["total_by_currency"].items():
+            # Chequear stop antes de abrir INSERT (no hay modal abierto)
+            if stop_event and stop_event.is_set():
+                try:
+                    exit_supplier(page)
+                except Exception:
+                    pass
+                raise PipelineStopped()
+
             records_for_currency = [rec for rec in records if rec["currency"] == currency]
             vouchers_for_currency = [rec["voucher"] for rec in records_for_currency]
             reference = f"INV{records_for_currency[0]['row_index']}{supplier_code}"
             log.info("    Moneda %s: total=%.2f, ref=%s, %d vouchers: %s",
                      currency, total, reference, len(records_for_currency), vouchers_for_currency)
+
+            stats.set_activity(currency=currency, voucher_total=len(records_for_currency), voucher_idx=0)
 
             page.get_by_role("button", name="INSERT").click()
             create_bulk_transaction(page, total, currency, reference)
@@ -149,24 +207,44 @@ def process_supplier_group(page, group: dict, rows: list[dict], filename: str, t
 
             skipped_vouchers: list[str] = []
             for i, rec in enumerate(records_for_currency):
+                # Chequear stop dentro del loop de vouchers (INSERT modal abierto → abortar)
+                if stop_event and stop_event.is_set():
+                    try:
+                        abort_transaction(page)
+                    except Exception:
+                        pass
+                    try:
+                        exit_supplier(page)
+                    except Exception:
+                        pass
+                    raise PipelineStopped()
+
                 voucher = rec["voucher"]
+                stats.set_activity(voucher=voucher, voucher_idx=i + 1)
                 try:
                     add_voucher_line(page, voucher, is_first=(i == 0))
                 except InvalidAccountError as e:
                     log.warning("    Voucher %s saltado — cuenta inválida: %s", voucher, e)
                     exit_invoice_line(page)
                     skipped_vouchers.append(voucher)
+                    entry = {
+                        "filename": filename,
+                        "supplier_code": supplier_code,
+                        "supplier_name": group.get("supplier_name", ""),
+                        "currency": currency,
+                        "voucher": e.voucher or voucher,
+                        "account": e.account or "?",
+                        "reason": str(e),
+                        "row_index": rec["row_index"],
+                    }
                     if skipped_report is not None:
-                        skipped_report.append({
-                            "filename": filename,
-                            "supplier_code": supplier_code,
-                            "supplier_name": group.get("supplier_name", ""),
-                            "currency": currency,
-                            "voucher": e.voucher or voucher,
-                            "account": e.account or "?",
-                            "reason": str(e),
-                            "row_index": rec["row_index"],
-                        })
+                        skipped_report.append(entry)
+                    stats.add_skipped(entry)
+                    stats.add_voucher_result({
+                        "filename": filename, "supplier_code": supplier_code,
+                        "voucher": entry["voucher"], "currency": currency,
+                        "status": "skipped", "error": entry["reason"], "row_index": rec["row_index"],
+                    })
 
             loaded_count = len(vouchers_for_currency) - len(skipped_vouchers)
 
@@ -183,9 +261,6 @@ def process_supplier_group(page, group: dict, rows: list[dict], filename: str, t
                     log.warning("    %d/%d vouchers cargados (saltados por cuenta inválida: %s)",
                                 loaded_count, len(vouchers_for_currency), skipped_vouchers)
 
-                # Política: guardar siempre que haya al menos 1 voucher cargado,
-                # sin importar el REMAINDER (TourplanNX lo permite). La diferencia
-                # queda registrada en el invoice para revisión posterior.
                 if remainder < 0.01:
                     log.info("    Totales cuadran: %s %s — REMAINDER=%.2f", supplier_code, currency, remainder)
                 else:
@@ -193,9 +268,18 @@ def process_supplier_group(page, group: dict, rows: list[dict], filename: str, t
                                 totals.get("remainder", "?"), supplier_code, currency)
 
                 save_invoice(page)
+                for rec in records_for_currency:
+                    if rec["voucher"] not in skipped_vouchers:
+                        stats.add_voucher_result({
+                            "filename": filename, "supplier_code": supplier_code,
+                            "voucher": rec["voucher"], "currency": currency,
+                            "status": "ok", "error": None, "row_index": rec["row_index"],
+                        })
 
         exit_supplier(page)
 
+    except PipelineStopped:
+        raise
     except Exception as e:
         log.error("  Proveedor %s FAILED: %s", supplier_code, e)
         group_ok = False
@@ -225,10 +309,15 @@ def run_pipeline(
     test_config: dict | None = None,
     no_tracker: bool = False,
     limit: int | None = None,
+    max_vouchers: int | None = None,
 ):
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     skipped_report: list[dict] = []
+    oversized_report: list[dict] = []
+
+    # Umbral de proveedores grandes (None → usar default de settings; <=0 → sin límite)
+    effective_max = max_vouchers if max_vouchers is not None else MAX_VOUCHERS_PER_SUPPLIER
 
     if no_tracker:
         tracker = None
@@ -260,6 +349,7 @@ def run_pipeline(
             shutil.move(str(filepath), str(PROCESSED_DIR / filename))
             continue
         log.info("Procesando archivo: %s (hoja: %s)", filename, sheet_name)
+        stats.set_activity(file=filename, sheet=sheet_name)
 
         rows = get_data_rows(filepath, sheet_name)
         if not rows:
@@ -305,31 +395,41 @@ def run_pipeline(
             log.info("  Lote: procesando %d de %d proveedores pendientes", limit, len(groups))
             groups = groups[:limit]
 
+        pipeline_stopped = False
         for i, group in enumerate(groups, 1):
             if stop_event and stop_event.is_set():
                 log.info("Detenido por usuario durante el procesamiento")
+                pipeline_stopped = True
                 break
 
             label = f"Proveedor {group['supplier_code']} ({group['size']} voucher{'s' if group['size'] > 1 else ''})"
             step = stats.add_step(label)
             stats.mark_running(step)
             try:
-                process_supplier_group(page, group, rows, filename, tracker, stats, skipped_report)
+                process_supplier_group(page, group, rows, filename, tracker, stats, skipped_report,
+                                       stop_event=stop_event, max_vouchers=effective_max,
+                                       oversized_report=oversized_report)
                 stats.mark_ok(step)
+            except PipelineStopped:
+                stats.mark_skipped(step)
+                log.info("  Detenido durante proveedor %s — filas vuelven a pending", group["supplier_code"])
+                if tracker:
+                    for rec in group["records"]:
+                        tracker.mark_row_pending(filename, rec["row_index"])
+                pipeline_stopped = True
+                break
             except Exception as e:
                 stats.mark_failed(step, str(e))
 
             log.info("  Progreso archivo: %d/%d proveedores", i, len(groups))
 
-        # Determinar si el archivo está completo (no quedan filas pendientes).
-        # En modo lote (limit) o si se detuvo, suele quedar trabajo → no mover aún.
+        # Determinar si mover el archivo o dejarlo en input/
         remaining = tracker.get_pending_rows(filename) if tracker else []
-        stopped = bool(stop_event and stop_event.is_set())
+        stopped = pipeline_stopped or bool(stop_event and stop_event.is_set())
 
         if remaining or stopped:
             n = len(remaining)
             if tracker:
-                # Dejar el archivo en input/ con estado 'processing' para el próximo lote.
                 tracker.mark_file_processing(filename)
             log.info("Archivo %s incompleto: quedan %d filas pendientes — permanece en input/", filename, n)
         else:
@@ -339,6 +439,9 @@ def run_pipeline(
             if tracker:
                 tracker.mark_file_completed(filename)
 
+        if pipeline_stopped:
+            break
+
         if test_config and test_config.get("test"):
             log.info("Modo prueba: solo 1 archivo procesado")
             break
@@ -346,4 +449,7 @@ def run_pipeline(
     report_path = write_skipped_report(skipped_report)
     if report_path:
         log.info("Reporte de vouchers salteados: %s (%d entradas)", report_path, len(skipped_report))
+    oversized_path = write_oversized_report(oversized_report)
+    if oversized_path:
+        log.info("Reporte de proveedores grandes (saltados): %s (%d entradas)", oversized_path, len(oversized_report))
     log.info("Pipeline finalizado")

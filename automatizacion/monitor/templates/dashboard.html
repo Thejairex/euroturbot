@@ -21,13 +21,22 @@
     <button id="btnStart" class="btn btn-primary">▶ Iniciar todo</button>
     <button id="btnStartPipeline" class="btn btn-success">📁 Solo archivos</button>
     <button id="btnStop" class="btn btn-danger" disabled>⏹ Detener</button>
+    <button id="btnForceStop" class="btn btn-force" disabled>⛔ Forzar detención</button>
     <button id="btnRefresh" class="btn btn-secondary">🔄 Refrescar</button>
   </section>
 
-  <section class="test-mode">
+  <section class="options-bar">
+    <label class="opt-toggle">
+      <input type="checkbox" id="chkVisible">
+      <span>👁 Navegador visible</span>
+    </label>
+    <label class="opt-toggle">
+      <input type="checkbox" id="chkNoTracker">
+      <span>⚡ Sin tracker</span>
+    </label>
     <label class="test-toggle">
       <input type="checkbox" id="chkTest">
-      <span>🧪 Modo prueba (1 registro)</span>
+      <span>🧪 Modo prueba</span>
     </label>
     <div class="test-controls" id="testControls" style="display:none">
       <label>
@@ -36,7 +45,11 @@
       </label>
       <label>
         Fila #:
-        <input type="number" id="inputRow" min="0" class="input-sm" placeholder="0">
+        <input type="number" id="inputRow" min="0" class="input-sm" placeholder="auto">
+      </label>
+      <label>
+        Proveedor:
+        <input type="text" id="inputSupplier" class="input-sm" placeholder="código">
       </label>
     </div>
   </section>
@@ -50,6 +63,7 @@
       <span id="progressText">0%</span>
       <span id="elapsedText">⏱ 0s</span>
     </div>
+    <div class="activity-line" id="activityLine" style="display:none"></div>
   </section>
 
   <section class="summary">
@@ -69,6 +83,67 @@
       <span class="card-label">Total</span>
       <span class="card-value" id="countTotal">0</span>
     </div>
+  </section>
+
+  <section class="steps">
+    <h2>Pasos</h2>
+    <table id="stepsTable">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Nombre</th>
+          <th>Estado</th>
+          <th>Duración</th>
+          <th>Error</th>
+        </tr>
+      </thead>
+      <tbody id="stepsBody"></tbody>
+    </table>
+  </section>
+
+  <section class="vouchers-section">
+    <div class="vouchers-header">
+      <h2>Vouchers procesados <span class="voucher-count" id="voucherCount"></span></h2>
+      <div class="voucher-filters">
+        <label class="filter-toggle filter-ok active" id="filterOk"><input type="checkbox" checked> ✅ OK</label>
+        <label class="filter-toggle filter-failed active" id="filterFailed"><input type="checkbox" checked> ❌ Fallidos</label>
+        <label class="filter-toggle filter-skipped active" id="filterSkipped"><input type="checkbox" checked> ⏭ Saltados</label>
+        <button id="btnClearVouchers" class="btn btn-tiny btn-secondary">Limpiar</button>
+      </div>
+    </div>
+    <div class="vouchers-table-wrap">
+      <table id="vouchersTable">
+        <thead>
+          <tr>
+            <th>Hora</th>
+            <th>Proveedor</th>
+            <th>Voucher</th>
+            <th>Moneda</th>
+            <th>Estado</th>
+            <th>Error</th>
+          </tr>
+        </thead>
+        <tbody id="vouchersBody">
+          <tr><td colspan="6" class="empty">Sin vouchers procesados aún</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="skipped-section" id="skippedSection" style="display:none">
+    <h2>Vouchers saltados</h2>
+    <table id="skippedTable">
+      <thead>
+        <tr>
+          <th>Voucher</th>
+          <th>Proveedor</th>
+          <th>Moneda</th>
+          <th>Cuenta</th>
+          <th>Motivo</th>
+        </tr>
+      </thead>
+      <tbody id="skippedBody"></tbody>
+    </table>
   </section>
 
   <section class="files-section">
@@ -95,25 +170,12 @@
     </table>
   </section>
 
-  <section class="steps">
-    <h2>Pasos</h2>
-    <table id="stepsTable">
-      <thead>
-        <tr>
-          <th>#</th>
-          <th>Nombre</th>
-          <th>Estado</th>
-          <th>Duración</th>
-          <th>Error</th>
-        </tr>
-      </thead>
-      <tbody id="stepsBody"></tbody>
-    </table>
-  </section>
-
-  <section class="logs">
-    <h2>Logs</h2>
-    <pre id="logOutput"><div class="log-empty">Esperando actividad...</div></pre>
+  <section class="events-section">
+    <div class="events-header">
+      <h2>Eventos en vivo</h2>
+      <button id="btnLoadLogs" class="btn btn-small btn-secondary">📄 Cargar log completo</button>
+    </div>
+    <div id="eventFeed" class="event-feed"><div class="log-empty">Esperando actividad...</div></div>
   </section>
 </main>
 
@@ -125,68 +187,145 @@ const statusText = $('statusText');
 const progressFill = $('progressFill');
 const progressText = $('progressText');
 const elapsedText = $('elapsedText');
+const activityLine = $('activityLine');
 const stepsBody = $('stepsBody');
 const filesBody = $('filesBody');
+const skippedBody = $('skippedBody');
+const skippedSection = $('skippedSection');
 const pendingBadge = $('pendingBadge');
-const logOutput = $('logOutput');
+const eventFeed = $('eventFeed');
 const btnStart = $('btnStart');
 const btnPipeline = $('btnStartPipeline');
 const btnStop = $('btnStop');
+const btnForceStop = $('btnForceStop');
 const btnRefresh = $('btnRefresh');
 const chkTest = $('chkTest');
+const chkVisible = $('chkVisible');
+const chkNoTracker = $('chkNoTracker');
 const testControls = $('testControls');
 const inputSheet = $('inputSheet');
 const inputRow = $('inputRow');
+const inputSupplier = $('inputSupplier');
+
+let prevState = 'idle';
 
 chkTest.addEventListener('change', function() {
   testControls.style.display = this.checked ? 'flex' : 'none';
 });
 
-function getTestQuery() {
-  if (!chkTest.checked) return '';
-  let q = '?test=true&sheet=' + encodeURIComponent(inputSheet.value || 'SI TRANS');
-  const r = inputRow.value;
-  if (r !== '') q += '&row=' + parseInt(r);
-  return q;
-}
-
-function setRunning(running) {
-  btnStart.disabled = running;
-  btnPipeline.disabled = running;
-  btnStop.disabled = !running;
-  chkTest.disabled = running;
-  inputSheet.disabled = running;
-  inputRow.disabled = running;
-}
-
-function setStatus(running, error) {
-  if (error) {
-    statusDot.className = 'status-indicator error';
-    statusText.textContent = 'Error';
-  } else if (running) {
-    statusDot.className = 'status-indicator running';
-    statusText.textContent = 'Ejecutando...';
-  } else {
-    statusDot.className = 'status-indicator idle';
-    statusText.textContent = 'Inactivo';
+function getStartQuery() {
+  const parts = [];
+  if (chkVisible.checked) parts.push('visible=true');
+  if (chkNoTracker.checked) parts.push('no_tracker=true');
+  if (chkTest.checked) {
+    parts.push('test=true');
+    parts.push('sheet=' + encodeURIComponent(inputSheet.value || 'SI TRANS'));
+    const r = inputRow.value.trim();
+    if (r !== '') parts.push('row=' + parseInt(r));
+    const s = inputSupplier.value.trim();
+    if (s !== '') parts.push('supplier=' + encodeURIComponent(s));
   }
+  return parts.length ? '?' + parts.join('&') : '';
 }
 
-function updateStats(data) {
-  const pct = data.progress_pct || 0;
+const STATE_MAP = {
+  idle:     { text: 'Inactivo',      cls: 'idle' },
+  running:  { text: 'Ejecutando...', cls: 'running' },
+  stopping: { text: 'Deteniendo...', cls: 'warning' },
+  hung:     { text: 'Colgado',       cls: 'error' },
+  finished: { text: 'Finalizado',    cls: 'idle' },
+  error:    { text: 'Error',         cls: 'error' },
+};
+
+function setStatusFromState(state, heartbeatAge) {
+  const s = STATE_MAP[state] || STATE_MAP.idle;
+  let text = s.text;
+  if (state === 'hung' && heartbeatAge != null) {
+    text = `Colgado (sin actividad ${Math.round(heartbeatAge)}s)`;
+  }
+  statusDot.className = 'status-indicator ' + s.cls;
+  statusText.textContent = text;
+}
+
+function setControlsFromState(state) {
+  const busy = ['running', 'stopping', 'hung'].includes(state);
+  btnStart.disabled = busy;
+  btnPipeline.disabled = busy;
+  chkTest.disabled = busy;
+  chkVisible.disabled = busy;
+  chkNoTracker.disabled = busy;
+  inputSheet.disabled = busy;
+  inputRow.disabled = busy;
+  inputSupplier.disabled = busy;
+  btnStop.disabled = !['running', 'stopping'].includes(state);
+  btnForceStop.disabled = !['running', 'stopping', 'hung'].includes(state);
+  btnForceStop.className = state === 'hung'
+    ? 'btn btn-force btn-force-active'
+    : 'btn btn-force';
+}
+
+function updateActivity(activity) {
+  if (!activity || Object.keys(activity).length === 0) {
+    activityLine.style.display = 'none';
+    return;
+  }
+  const parts = [];
+  if (activity.file) parts.push('📄 ' + activity.file);
+  if (activity.sheet && activity.sheet !== activity.file) parts.push(activity.sheet);
+  if (activity.supplier) {
+    let sup = activity.supplier;
+    if (activity.supplier_name) sup += ' — ' + activity.supplier_name;
+    parts.push(sup);
+  }
+  if (activity.currency) parts.push(activity.currency);
+  if (activity.voucher) {
+    let v = activity.voucher;
+    if (activity.voucher_idx && activity.voucher_total) {
+      v += ` (${activity.voucher_idx}/${activity.voucher_total})`;
+    }
+    parts.push(v);
+  }
+  activityLine.textContent = parts.join(' › ');
+  activityLine.style.display = parts.length ? 'block' : 'none';
+}
+
+function updateSkipped(skippedVouchers) {
+  if (!skippedVouchers || skippedVouchers.length === 0) {
+    skippedSection.style.display = 'none';
+    return;
+  }
+  skippedSection.style.display = 'block';
+  skippedBody.innerHTML = '';
+  skippedVouchers.forEach(sv => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${escapeHtml(sv.voucher || '-')}</td>
+      <td>${escapeHtml(sv.supplier_code || '-')}${sv.supplier_name ? ' — ' + escapeHtml(sv.supplier_name) : ''}</td>
+      <td>${escapeHtml(sv.currency || '-')}</td>
+      <td class="error-cell">${escapeHtml(sv.account || '-')}</td>
+      <td class="error-cell">${escapeHtml(sv.reason || '-')}</td>
+    `;
+    skippedBody.appendChild(tr);
+  });
+}
+
+function updateStats(statsData, state, heartbeatAge) {
+  if (!statsData) return;
+  const pct = statsData.progress_pct || 0;
   progressFill.style.width = pct + '%';
   progressText.textContent = pct + '%';
-  elapsedText.textContent = '⏱ ' + data.elapsed_seconds + 's';
-  $('countOk').textContent = data.ok || 0;
-  $('countFailed').textContent = data.failed || 0;
-  $('countSkipped').textContent = data.skipped || 0;
-  $('countTotal').textContent = data.total || 0;
-  setStatus(data.running, data.error);
-  if (data.finished) setRunning(false);
+  elapsedText.textContent = '⏱ ' + (statsData.elapsed_seconds || 0) + 's';
+  $('countOk').textContent = statsData.ok || 0;
+  $('countFailed').textContent = statsData.failed || 0;
+  $('countSkipped').textContent = statsData.skipped || 0;
+  $('countTotal').textContent = statsData.total || 0;
+
+  updateActivity(statsData.activity);
+  updateSkipped(statsData.skipped_vouchers);
 
   stepsBody.innerHTML = '';
-  if (data.steps && data.steps.length > 0) {
-    data.steps.forEach((s, i) => {
+  if (statsData.steps && statsData.steps.length > 0) {
+    statsData.steps.forEach((s, i) => {
       const tr = document.createElement('tr');
       let icon = '⏳';
       if (s.status === 'ok') icon = '✅';
@@ -195,10 +334,10 @@ function updateStats(data) {
       else if (s.status === 'skipped') icon = '⏭️';
       tr.innerHTML = `
         <td>${i + 1}</td>
-        <td>${s.name}</td>
+        <td>${escapeHtml(s.name)}</td>
         <td class="status-${s.status}">${icon} ${s.status}</td>
         <td>${s.duration || '-'}s</td>
-        <td class="error-cell">${s.error || '-'}</td>
+        <td class="error-cell">${escapeHtml(s.error || '-')}</td>
       `;
       stepsBody.appendChild(tr);
     });
@@ -208,7 +347,8 @@ function updateStats(data) {
 }
 
 function updateTracker(data) {
-  pendingBadge.textContent = '📁 Pendientes: ' + (data.pending || 0);
+  const pending = Array.isArray(data.pending) ? data.pending.length : (data.pending || 0);
+  pendingBadge.textContent = '📁 Pendientes: ' + pending;
 
   filesBody.innerHTML = '';
   if (data.files && data.files.length > 0) {
@@ -219,13 +359,13 @@ function updateTracker(data) {
       else if (f.status === 'failed') icon = '❌';
       else if (f.status === 'processing') icon = '🔄';
       tr.innerHTML = `
-        <td title="${f.filename}">${f.filename}</td>
+        <td title="${escapeHtml(f.filename)}">${escapeHtml(f.filename)}</td>
         <td class="status-${f.status}">${icon} ${f.status}</td>
         <td>${f.total_rows}</td>
         <td class="status-ok">${f.ok_rows || 0}</td>
         <td class="status-failed">${f.failed_rows || 0}</td>
-        <td class="error-cell">${f.error || '-'}</td>
-        <td><button class="btn btn-tiny btn-danger" onclick="resetFile('${f.filename}')">✕</button></td>
+        <td class="error-cell">${escapeHtml(f.error || '-')}</td>
+        <td><button class="btn btn-tiny btn-danger" onclick="resetFile('${escapeHtml(f.filename)}')">✕</button></td>
       `;
       filesBody.appendChild(tr);
     });
@@ -234,23 +374,117 @@ function updateTracker(data) {
   }
 }
 
+const MAX_FEED_ITEMS = 300;
+const seenSeqs = new Set();
+
+// ── Vouchers ──────────────────────────────────────────────────────────────────
+const vouchersBody = $('vouchersBody');
+const voucherCount = $('voucherCount');
+const MAX_VOUCHER_ROWS = 500;
+const seenVoucherSeqs = new Set();
+let totalVouchers = 0;
+
+const filterState = { ok: true, failed: true, skipped: true };
+
+['Ok', 'Failed', 'Skipped'].forEach(key => {
+  const lk = key.toLowerCase();
+  const el = $('filter' + key);
+  el.querySelector('input').addEventListener('change', function() {
+    filterState[lk] = this.checked;
+    el.classList.toggle('active', this.checked);
+    applyVoucherFilter();
+  });
+});
+
+$('btnClearVouchers').addEventListener('click', function() {
+  vouchersBody.innerHTML = '<tr><td colspan="6" class="empty">Sin vouchers procesados aún</td></tr>';
+  seenVoucherSeqs.clear();
+  totalVouchers = 0;
+  updateVoucherCount();
+});
+
+function updateVoucherCount() {
+  voucherCount.textContent = totalVouchers > 0 ? `(${totalVouchers})` : '';
+}
+
+function applyVoucherFilter() {
+  Array.from(vouchersBody.querySelectorAll('tr[data-status]')).forEach(tr => {
+    tr.style.display = filterState[tr.dataset.status] ? '' : 'none';
+  });
+}
+
+function prependVouchers(vouchers) {
+  if (!vouchers || vouchers.length === 0) return;
+
+  const placeholder = vouchersBody.querySelector('.empty');
+  if (placeholder) placeholder.parentElement.removeChild(placeholder);
+
+  vouchers.forEach(v => {
+    if (seenVoucherSeqs.has(v.seq)) return;
+    seenVoucherSeqs.add(v.seq);
+    totalVouchers++;
+
+    const tr = document.createElement('tr');
+    tr.dataset.status = v.status;
+    if (!filterState[v.status]) tr.style.display = 'none';
+
+    let icon = '✅';
+    if (v.status === 'failed') icon = '❌';
+    else if (v.status === 'skipped') icon = '⏭️';
+
+    tr.innerHTML = `
+      <td class="voucher-ts">${escapeHtml(v.ts || '')}</td>
+      <td>${escapeHtml(v.supplier_code || '-')}</td>
+      <td class="voucher-number">${escapeHtml(v.voucher || '-')}</td>
+      <td>${escapeHtml(v.currency || '-')}</td>
+      <td class="status-${v.status}">${icon} ${v.status}</td>
+      <td class="error-cell">${escapeHtml(v.error || '-')}</td>
+    `;
+    // Insertar al principio (newest first)
+    vouchersBody.insertBefore(tr, vouchersBody.firstChild);
+  });
+
+  // Limitar DOM
+  while (vouchersBody.children.length > MAX_VOUCHER_ROWS) {
+    vouchersBody.removeChild(vouchersBody.lastChild);
+  }
+
+  updateVoucherCount();
+}
+
+function appendEvents(events) {
+  if (!events || events.length === 0) return;
+
+  const wasAtBottom = eventFeed.scrollHeight - eventFeed.scrollTop <= eventFeed.clientHeight + 50;
+
+  const placeholder = eventFeed.querySelector('.log-empty');
+  if (placeholder) placeholder.remove();
+
+  events.forEach(ev => {
+    if (seenSeqs.has(ev.seq)) return;
+    seenSeqs.add(ev.seq);
+
+    const d = document.createElement('div');
+    d.className = 'event-line event-' + ev.level.toLowerCase();
+    d.textContent = ev.ts + ' ' + ev.message;
+    eventFeed.appendChild(d);
+  });
+
+  // Limitar DOM a MAX_FEED_ITEMS
+  while (eventFeed.children.length > MAX_FEED_ITEMS) {
+    eventFeed.removeChild(eventFeed.firstChild);
+  }
+
+  if (wasAtBottom) {
+    eventFeed.scrollTop = eventFeed.scrollHeight;
+  }
+}
+
 function resetFile(filename) {
   if (!confirm('¿Resetear ' + filename + '?')) return;
   fetch('/api/tracker/reset?file=' + encodeURIComponent(filename), { method: 'POST' })
     .then(r => r.json())
     .then(() => { fetchTracker(); })
-    .catch(() => {});
-}
-
-function fetchLogs() {
-  fetch('/api/logs?lines=50')
-    .then(r => r.json())
-    .then(data => {
-      if (data.logs && data.logs.length > 0) {
-        logOutput.innerHTML = data.logs.map(l => '<div>' + escapeHtml(l) + '</div>').join('');
-        logOutput.scrollTop = logOutput.scrollHeight;
-      }
-    })
     .catch(() => {});
 }
 
@@ -263,50 +497,73 @@ function fetchTracker() {
 
 function escapeHtml(text) {
   const d = document.createElement('div');
-  d.textContent = text;
+  d.textContent = String(text);
   return d.innerHTML;
 }
 
 function connectSSE() {
   const evtSource = new EventSource('/api/stream');
+
   evtSource.onmessage = function(e) {
     const data = JSON.parse(e.data);
-    updateStats(data);
-    fetchLogs();
-    fetchTracker();
+    const state = data.state || 'idle';
+
+    setStatusFromState(state, data.heartbeat_age);
+    setControlsFromState(state);
+    updateStats(data.stats, state, data.heartbeat_age);
+
+    if (data.events) appendEvents(data.events);
+    if (data.vouchers) prependVouchers(data.vouchers);
+
+    // Refrescar tracker al pasar de busy → finished/error
+    if (['running', 'stopping', 'hung'].includes(prevState) && ['finished', 'error', 'idle'].includes(state)) {
+      fetchTracker();
+    }
+    prevState = state;
   };
+
   evtSource.onerror = function() {
     evtSource.close();
     setTimeout(connectSSE, 2000);
   };
 }
 
-function startRequest(url, btn, text) {
-  setRunning(true);
+btnStart.addEventListener('click', function() {
+  const btn = this;
+  btn.disabled = true;
   btn.textContent = '⏳ Iniciando...';
-  fetch(url + getTestQuery(), { method: 'POST' })
+  fetch('/api/start' + getStartQuery(), { method: 'POST' })
     .then(r => r.json())
     .then(data => {
-      btn.textContent = text;
-      if (data.status === 'ok') {
-        connectSSE();
-      } else {
+      btn.textContent = '▶ Iniciar todo';
+      if (data.status !== 'ok') {
         alert(data.message);
-        setRunning(false);
+        setControlsFromState(prevState);
       }
     })
     .catch(() => {
-      btn.textContent = text;
-      setRunning(false);
+      btn.textContent = '▶ Iniciar todo';
+      setControlsFromState(prevState);
     });
-}
-
-btnStart.addEventListener('click', function() {
-  startRequest('/api/start', this, '▶ Iniciar todo');
 });
 
 btnPipeline.addEventListener('click', function() {
-  startRequest('/api/start/pipeline', this, '📁 Solo archivos');
+  const btn = this;
+  btn.disabled = true;
+  btn.textContent = '⏳ Iniciando...';
+  fetch('/api/start/pipeline' + getStartQuery(), { method: 'POST' })
+    .then(r => r.json())
+    .then(data => {
+      btn.textContent = '📁 Solo archivos';
+      if (data.status !== 'ok') {
+        alert(data.message);
+        setControlsFromState(prevState);
+      }
+    })
+    .catch(() => {
+      btn.textContent = '📁 Solo archivos';
+      setControlsFromState(prevState);
+    });
 });
 
 btnStop.addEventListener('click', function() {
@@ -314,20 +571,39 @@ btnStop.addEventListener('click', function() {
   this.textContent = '⏳ Deteniendo...';
   fetch('/api/stop', { method: 'POST' })
     .then(r => r.json())
-    .then(() => {
+    .then(data => {
       this.textContent = '⏹ Detener';
+      if (data.status !== 'ok') alert(data.message);
     })
     .catch(() => {
-      this.disabled = false;
       this.textContent = '⏹ Detener';
+    });
+});
+
+btnForceStop.addEventListener('click', function() {
+  if (!confirm('¿Forzar detención? Esto cerrará el navegador inmediatamente.')) return;
+  const btn = this;
+  btn.disabled = true;
+  btn.textContent = '⏳ Forzando...';
+  fetch('/api/stop?force=true', { method: 'POST' })
+    .then(r => r.json())
+    .then(data => {
+      btn.textContent = '⛔ Forzar detención';
+      alert(data.message);
+    })
+    .catch(() => {
+      btn.textContent = '⛔ Forzar detención';
     });
 });
 
 btnRefresh.addEventListener('click', function() {
   fetch('/api/stats')
     .then(r => r.json())
-    .then(updateStats);
-  fetchLogs();
+    .then(data => {
+      setStatusFromState(data.state || 'idle', data.heartbeat_age);
+      setControlsFromState(data.state || 'idle');
+      updateStats(data.stats, data.state, data.heartbeat_age);
+    });
   fetchTracker();
 });
 
@@ -339,8 +615,28 @@ $('btnResetAll').addEventListener('click', function() {
     .catch(() => {});
 });
 
-fetchLogs();
+$('btnLoadLogs').addEventListener('click', function() {
+  fetch('/api/logs?lines=200')
+    .then(r => r.json())
+    .then(data => {
+      if (data.logs && data.logs.length > 0) {
+        eventFeed.innerHTML = '';
+        seenSeqs.clear();
+        data.logs.forEach(line => {
+          const d = document.createElement('div');
+          d.className = 'event-line event-info';
+          d.textContent = line;
+          eventFeed.appendChild(d);
+        });
+        eventFeed.scrollTop = eventFeed.scrollHeight;
+      }
+    })
+    .catch(() => {});
+});
+
+// Arrancar SSE y tracker al cargar
 fetchTracker();
+connectSSE();
 </script>
 
 </body>

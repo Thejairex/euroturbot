@@ -32,3 +32,7 @@ REPORT_DIR = BASE_DIR / "outputs" / "reports"
 
 SCREENSHOT_ON_ERROR = True
 MAX_RETRIES = 3
+
+# Proveedores con más de N vouchers (no-MEP) se saltan en la corrida masiva y se
+# reportan aparte (entidades internas tipo 1EURO1/1ING01, inviables por UI).
+MAX_VOUCHERS_PER_SUPPLIER = 500

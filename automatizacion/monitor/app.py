@@ -1,16 +1,17 @@
 import asyncio
 import json
+from collections import deque
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from core.stats import StatsTracker
-from data.tracker import ProcessTracker
+from config.settings import LOG_DIR
 from core.pipeline import INPUT_DIR
-from main import run_automation_thread, run_pipeline_thread, stop_automation
-from utils.logger import log
+from data.tracker import ProcessTracker
+from main import run_manager
 
 app = FastAPI(title="Monitor de Automatización")
 
@@ -19,124 +20,148 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-stats = StatsTracker()
-_automation_lock = asyncio.Lock()
-
 
 def _load_html() -> str:
-    path = TEMPLATES_DIR / "dashboard.html"
-    return path.read_text(encoding="utf-8")
-
-
-HTML_CACHE = _load_html()
+    return (TEMPLATES_DIR / "dashboard.html").read_text(encoding="utf-8")
 
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    return HTML_CACHE
+    return _load_html()
 
 
 @app.get("/api/stats")
 async def get_stats():
-    return stats.results
+    return run_manager.snapshot()
 
 
 @app.get("/api/stream")
 async def stream_stats(request: Request):
     async def event_generator():
+        last_seq = 0
+        last_voucher_seq = 0
         while True:
             if await request.is_disconnected():
                 break
-            data = stats.results
-            yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-            if data.get("finished"):
-                break
+            snap = run_manager.snapshot()
+            s = run_manager.stats
+            new_events = s.events_after(last_seq) if s else []
+            new_vouchers = s.vouchers_after(last_voucher_seq) if s else []
+            if new_events:
+                last_seq = new_events[-1]["seq"]
+            if new_vouchers:
+                last_voucher_seq = new_vouchers[-1]["seq"]
+            snap["events"] = new_events
+            snap["vouchers"] = new_vouchers
+            yield f"data: {json.dumps(snap, ensure_ascii=False)}\n\n"
             await asyncio.sleep(0.5)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-def _build_test_config(request: Request) -> dict | None:
-    test = request.query_params.get("test", "").lower() in ("true", "1", "yes")
-    if not test:
-        return None
-    cfg: dict = {"test": True, "sheet": request.query_params.get("sheet", "SI TRANS")}
-    row = request.query_params.get("row")
-    if row is not None and row.strip():
-        try:
-            cfg["row"] = int(row)
-        except ValueError:
-            pass
-    return cfg
+def _build_run_options(request: Request) -> dict:
+    qp = request.query_params
+    truthy = lambda k: qp.get(k, "").lower() in ("true", "1", "yes")
+    opts: dict = {
+        "headless": not truthy("visible"),
+        "no_tracker": truthy("no_tracker"),
+    }
+    if truthy("test"):
+        cfg: dict = {"test": True, "sheet": qp.get("sheet") or "SI TRANS"}
+        raw_row = qp.get("row", "").strip()
+        if raw_row:
+            try:
+                cfg["row"] = int(raw_row)
+            except ValueError:
+                pass
+        supplier = qp.get("supplier", "").strip()
+        if supplier:
+            cfg["supplier"] = supplier
+        opts["test_config"] = cfg
+    return opts
 
 
 @app.post("/api/start")
 async def start_automation(request: Request):
-    global stats
-    if _automation_lock.locked():
-        return {"status": "error", "message": "Ya hay una automatización en ejecución"}
-
-    test_config = _build_test_config(request)
-    stats = StatsTracker()
-    run_automation_thread(stats, headless=True, test_config=test_config)
-    return {"status": "ok", "message": "Automatización iniciada"}
+    opts = _build_run_options(request)
+    ok, msg = run_manager.start("full", **opts)
+    return {"status": "ok" if ok else "error", "message": msg}
 
 
 @app.post("/api/start/pipeline")
 async def start_pipeline(request: Request):
-    global stats
-    if _automation_lock.locked():
-        return {"status": "error", "message": "Ya hay una automatización en ejecución"}
-
-    test_config = _build_test_config(request)
-    stats = StatsTracker()
-    run_pipeline_thread(stats, headless=True, test_config=test_config)
-    return {"status": "ok", "message": "Pipeline iniciado"}
+    opts = _build_run_options(request)
+    ok, msg = run_manager.start("pipeline", **opts)
+    return {"status": "ok" if ok else "error", "message": msg}
 
 
 @app.post("/api/stop")
-async def stop_automation_endpoint():
-    stop_automation()
-    return {"status": "ok", "message": "Deteniendo... el pipeline se detendrá al finalizar la fila actual"}
+async def stop_automation_endpoint(force: bool = False):
+    if force:
+        ok, msg = await run_in_threadpool(run_manager.force_stop)
+    else:
+        ok, msg = run_manager.stop()
+    return {"status": "ok" if ok else "error", "message": msg}
 
 
 @app.get("/api/logs")
-async def get_logs(lines: int = 50):
-    log_path = Path("outputs") / "logs" / "automation.log"
+async def get_logs(lines: int = 100):
+    log_path = Path(LOG_DIR) / "automation.log"
     if not log_path.exists():
         return {"logs": []}
-    content = log_path.read_text(encoding="utf-8").splitlines()
-    return {"logs": content[-lines:]}
+
+    def _read():
+        with log_path.open(encoding="utf-8", errors="replace") as f:
+            return [l.rstrip("\n") for l in deque(f, maxlen=lines)]
+
+    content = await run_in_threadpool(_read)
+    return {"logs": content}
 
 
 @app.get("/api/tracker")
 async def get_tracker():
-    tracker = ProcessTracker()
-    summary = tracker.get_summary()
-    pending = []
-    if INPUT_DIR.exists():
-        pending = [f.name for f in sorted(INPUT_DIR.glob("*.xlsx"))]
-    sheets = []
-    for f in sorted(INPUT_DIR.glob("*.xlsx")):
-        try:
-            import pandas as pd
-            xls = pd.ExcelFile(f)
-            sheets = [s for s in xls.sheet_names if s not in ("Sheet2",)]
-        except Exception:
-            pass
-    return {"files": summary, "pending": pending, "sheets": sheets}
+    def _fetch():
+        tracker = ProcessTracker()
+        summary = tracker.get_summary()
+        pending = []
+        if INPUT_DIR.exists():
+            pending = [f.name for f in sorted(INPUT_DIR.glob("*.xlsx"))]
+        return {"files": summary, "pending": pending}
+
+    return await run_in_threadpool(_fetch)
+
+
+@app.get("/api/sheets")
+async def get_sheets():
+    """Devuelve las hojas de cada xlsx en input/. Solo se llama on-demand."""
+    def _fetch():
+        result = {}
+        if INPUT_DIR.exists():
+            for f in sorted(INPUT_DIR.glob("*.xlsx")):
+                try:
+                    import pandas as pd
+                    xls = pd.ExcelFile(f)
+                    result[f.name] = [s for s in xls.sheet_names if s not in ("Sheet2",)]
+                except Exception:
+                    result[f.name] = []
+        return result
+
+    return await run_in_threadpool(_fetch)
 
 
 @app.post("/api/tracker/reset")
 async def reset_tracker(file: str = "", all: bool = False):
-    tracker = ProcessTracker()
-    if all:
-        tracker.reset_all()
-        return {"status": "ok", "message": "Tracker reseteado completamente"}
-    if file:
-        tracker.reset_file(file)
-        return {"status": "ok", "message": f"Tracker reseteado para: {file}"}
-    return {"status": "error", "message": "Especificá ?all=true o ?file=nombre.xlsx"}
+    def _reset():
+        tracker = ProcessTracker()
+        if all:
+            tracker.reset_all()
+            return {"status": "ok", "message": "Tracker reseteado completamente"}
+        if file:
+            tracker.reset_file(file)
+            return {"status": "ok", "message": f"Tracker reseteado para: {file}"}
+        return {"status": "error", "message": "Especificá ?all=true o ?file=nombre.xlsx"}
+
+    return await run_in_threadpool(_reset)
 
 
 if __name__ == "__main__":
