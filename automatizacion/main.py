@@ -83,7 +83,7 @@ def _finish(browser: BrowserManager, stats: StatsTracker, error: str | None = No
         _force_exit(stats)
 
 
-def run_automation(stats: StatsTracker, headless: bool = False, test_config: dict | None = None, no_tracker: bool = False, use_session: bool = True):
+def run_automation(stats: StatsTracker, headless: bool = False, test_config: dict | None = None, no_tracker: bool = False, use_session: bool = True, limit: int | None = None):
     stats.start_run()
     browser = BrowserManager(headless=headless)
     tracker = ProcessTracker() if not no_tracker else None
@@ -114,7 +114,7 @@ def run_automation(stats: StatsTracker, headless: bool = False, test_config: dic
             browser.save_session(store)
             log.info("Sesión guardada en disco.")
 
-        run_pipeline(page, stats, tracker, stop_event=_stop_event, test_config=test_config, no_tracker=no_tracker)
+        run_pipeline(page, stats, tracker, stop_event=_stop_event, test_config=test_config, no_tracker=no_tracker, limit=limit)
 
         log.info("Automatización completada. Progreso: %s%%", stats.progress)
 
@@ -208,6 +208,7 @@ def parse_args():
     parser.add_argument("--fresh-login", action="store_true", help="Ignorar sesión guardada y hacer login desde cero")
     parser.add_argument("--clear-session", action="store_true", help="Borrar la sesión guardada en disco y salir")
     parser.add_argument("--supplier", type=str, help="Procesar solo el proveedor con este Supplier_Code (para testing masivo)")
+    parser.add_argument("--limit", type=int, default=None, help="Procesar como máximo N proveedores pendientes por corrida (modo lote)")
     return parser.parse_args()
 
 
@@ -264,7 +265,7 @@ def main():
         log.info("--fresh-login: sesión anterior borrada.")
 
     stats = StatsTracker()
-    run_automation(stats, headless=headless, test_config=test_config, no_tracker=args.no_tracker, use_session=use_session)
+    run_automation(stats, headless=headless, test_config=test_config, no_tracker=args.no_tracker, use_session=use_session, limit=args.limit)
 
     sys.exit(1 if stats.error else 0)
 

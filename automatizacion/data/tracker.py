@@ -156,6 +156,23 @@ class ProcessTracker:
         )
         self._conn.commit()
 
+    def mark_row_skipped(self, filename: str, row_index: int):
+        """Marca una fila como no procesable (ej. MEP) para que no cuente como pendiente."""
+        self._conn.execute(
+            "UPDATE processed_rows SET status = 'skipped', processed_at = ? WHERE filename = ? AND row_index = ?",
+            (time.strftime("%Y-%m-%d %H:%M:%S"), filename, row_index),
+        )
+        self._conn.commit()
+
+    def reset_processing_to_pending(self, filename: str) -> int:
+        """Vuelve a 'pending' las filas que quedaron en 'processing' (grupos cortados por una caída)."""
+        cur = self._conn.execute(
+            "UPDATE processed_rows SET status = 'pending' WHERE filename = ? AND status = 'processing'",
+            (filename,),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
     def get_row(self, filename: str, row_index: int) -> dict | None:
         cur = self._conn.execute(
             "SELECT * FROM processed_rows WHERE filename = ? AND row_index = ?",

@@ -100,15 +100,20 @@ def process_supplier_group(page, group: dict, rows: list[dict], filename: str, t
     supplier_code = group["supplier_code"]
     records = group["records"]
 
-    if group["size"] == 1:
-        rec = records[0]
-        process_row(page, rows[rec["row_index"]], rec["row_index"], filename, tracker, stats)
-        return
-
+    # Marcar las filas MEP como 'skipped' (no procesables) para que no queden
+    # pendientes eternamente y el archivo pueda completarse.
     skipped_mep = group.get("skipped_mep", [])
     if skipped_mep:
         log.info("  Proveedor %s — %d registros MEP ignorados (filas: %s)",
                  supplier_code, len(skipped_mep), skipped_mep)
+        if tracker:
+            for idx in skipped_mep:
+                tracker.mark_row_skipped(filename, idx)
+
+    if group["size"] == 1:
+        rec = records[0]
+        process_row(page, rows[rec["row_index"]], rec["row_index"], filename, tracker, stats)
+        return
 
     if not group["total_by_currency"]:
         log.warning("  Proveedor %s — todos los registros son MEP, nada que procesar", supplier_code)
@@ -219,6 +224,7 @@ def run_pipeline(
     stop_event: Event | None = None,
     test_config: dict | None = None,
     no_tracker: bool = False,
+    limit: int | None = None,
 ):
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
@@ -266,6 +272,10 @@ def run_pipeline(
             tracker.mark_file_pending(filename, file_hash, len(rows))
             tracker.init_rows(filename, rows)
             tracker.mark_file_processing(filename)
+            # Recuperar grupos interrumpidos por una caída previa (processing → pending)
+            recovered = tracker.reset_processing_to_pending(filename)
+            if recovered:
+                log.info("  Recuperadas %d filas 'processing' → 'pending' (corrida previa interrumpida)", recovered)
             pending_rows = tracker.get_pending_rows(filename)
         else:
             pending_rows = [{"row_index": i} for i in range(len(rows))]
@@ -291,6 +301,10 @@ def run_pipeline(
         pending_indices = [r["row_index"] for r in pending_rows]
         groups = group_rows_by_supplier(rows, pending_indices)
 
+        if limit is not None and limit > 0 and len(groups) > limit:
+            log.info("  Lote: procesando %d de %d proveedores pendientes", limit, len(groups))
+            groups = groups[:limit]
+
         for i, group in enumerate(groups, 1):
             if stop_event and stop_event.is_set():
                 log.info("Detenido por usuario durante el procesamiento")
@@ -307,14 +321,22 @@ def run_pipeline(
 
             log.info("  Progreso archivo: %d/%d proveedores", i, len(groups))
 
-        moved = PROCESSED_DIR / filename
-        shutil.move(str(filepath), str(moved))
-        log.info("Archivo movido a processed/: %s", filename)
+        # Determinar si el archivo está completo (no quedan filas pendientes).
+        # En modo lote (limit) o si se detuvo, suele quedar trabajo → no mover aún.
+        remaining = tracker.get_pending_rows(filename) if tracker else []
+        stopped = bool(stop_event and stop_event.is_set())
 
-        if tracker:
-            if stop_event and stop_event.is_set():
-                tracker.mark_file_completed(filename, "Detenido por usuario")
-            else:
+        if remaining or stopped:
+            n = len(remaining)
+            if tracker:
+                # Dejar el archivo en input/ con estado 'processing' para el próximo lote.
+                tracker.mark_file_processing(filename)
+            log.info("Archivo %s incompleto: quedan %d filas pendientes — permanece en input/", filename, n)
+        else:
+            moved = PROCESSED_DIR / filename
+            shutil.move(str(filepath), str(moved))
+            log.info("Archivo movido a processed/: %s", filename)
+            if tracker:
                 tracker.mark_file_completed(filename)
 
         if test_config and test_config.get("test"):
