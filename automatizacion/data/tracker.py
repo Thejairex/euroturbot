@@ -178,6 +178,17 @@ class ProcessTracker:
         )
         self._conn.commit()
 
+    def mark_rows_skipped_bulk(self, filename: str, row_indices: list[int]):
+        """Marca múltiples filas como skipped en una sola transacción."""
+        if not row_indices:
+            return
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._conn.executemany(
+            "UPDATE processed_rows SET status = 'skipped', processed_at = ? WHERE filename = ? AND row_index = ?",
+            [(now, filename, idx) for idx in row_indices],
+        )
+        self._conn.commit()
+
     def mark_row_pending(self, filename: str, row_index: int):
         """Vuelve una fila a 'pending' (para reintento tras abortar un grupo)."""
         self._conn.execute(

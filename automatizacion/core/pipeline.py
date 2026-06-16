@@ -132,8 +132,7 @@ def process_supplier_group(
         log.info("  Proveedor %s — %d registros MEP ignorados (filas: %s)",
                  supplier_code, len(skipped_mep), skipped_mep)
         if tracker:
-            for idx in skipped_mep:
-                tracker.mark_row_skipped(filename, idx)
+            tracker.mark_rows_skipped_bulk(filename, skipped_mep)
 
     # Proveedores grandes: superan el umbral de vouchers → saltar y reportar
     # (entidades internas tipo 1EURO1/1ING01, inviables de cargar por UI).
@@ -143,8 +142,7 @@ def process_supplier_group(
         log.warning("  Proveedor %s SALTADO: %d vouchers > umbral %d — para revisión manual",
                     supplier_code, group["size"], max_vouchers)
         if tracker:
-            for rec in records:
-                tracker.mark_row_skipped(filename, rec["row_index"])
+            tracker.mark_rows_skipped_bulk(filename, [rec["row_index"] for rec in records])
         if oversized_report is not None:
             oversized_report.append({
                 "filename": filename,
@@ -223,6 +221,11 @@ def process_supplier_group(
                 stats.set_activity(voucher=voucher, voucher_idx=i + 1)
                 try:
                     add_voucher_line(page, voucher, is_first=(i == 0))
+                    stats.add_voucher_result({
+                        "filename": filename, "supplier_code": supplier_code,
+                        "voucher": voucher, "currency": currency,
+                        "status": "ok", "error": None, "row_index": rec["row_index"],
+                    })
                 except InvalidAccountError as e:
                     log.warning("    Voucher %s saltado — cuenta inválida: %s", voucher, e)
                     exit_invoice_line(page)
@@ -268,13 +271,6 @@ def process_supplier_group(
                                 totals.get("remainder", "?"), supplier_code, currency)
 
                 save_invoice(page)
-                for rec in records_for_currency:
-                    if rec["voucher"] not in skipped_vouchers:
-                        stats.add_voucher_result({
-                            "filename": filename, "supplier_code": supplier_code,
-                            "voucher": rec["voucher"], "currency": currency,
-                            "status": "ok", "error": None, "row_index": rec["row_index"],
-                        })
 
         exit_supplier(page)
 

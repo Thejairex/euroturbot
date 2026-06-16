@@ -1,0 +1,32 @@
+# Entorno virtual y caché Python
+venv/
+.venv/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache/
+
+# Credenciales (se montan como volumen, no se copian)
+automatizacion/.env
+
+# Datos de ejecución (se montan como volúmenes)
+automatizacion/input/
+automatizacion/processed/
+automatizacion/outputs/
+
+# Git
+.git/
+.gitignore
+
+# Archivos del IDE y sistema
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
