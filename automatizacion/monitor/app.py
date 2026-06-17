@@ -157,9 +157,9 @@ async def get_history(limit: int = 500):
         db_path = BASE_DIR / "outputs" / "tracker.db"
         if not db_path.exists():
             return {"vouchers": []}
-        conn = sqlite3.connect(str(db_path))
-        conn.row_factory = sqlite3.Row
         try:
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT filename, row_index, booking_reference, supplier_code, currency, "
                 "status, error, processed_at "
@@ -169,8 +169,9 @@ async def get_history(limit: int = 500):
                 "LIMIT ?",
                 (limit,),
             ).fetchall()
-        finally:
             conn.close()
+        except Exception:
+            return {"vouchers": [], "error": "tracker.db no disponible"}
         result = []
         for r in rows:
             ts_raw = r["processed_at"] or ""
