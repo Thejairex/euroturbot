@@ -150,38 +150,24 @@ async def get_sheets():
 
 
 @app.get("/api/history")
-async def get_history(limit: int = 500):
-    """Devuelve los últimos N vouchers procesados de sesiones anteriores (desde tracker.db)."""
+async def get_history():
+    """Devuelve todos los vouchers procesados de sesiones anteriores (desde tracker.db).
+    Si ORDER BY falla (DB corrupta), lee en chunks sin ordenar."""
     def _fetch():
         import sqlite3
         db_path = BASE_DIR / "outputs" / "tracker.db"
         if not db_path.exists():
-            return {"vouchers": []}
-        try:
-            conn = sqlite3.connect(str(db_path))
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT filename, row_index, booking_reference, supplier_code, currency, "
-                "status, error, processed_at "
-                "FROM processed_rows "
-                "WHERE status IN ('ok', 'failed', 'skipped') "
-                "ORDER BY processed_at DESC "
-                "LIMIT ?",
-                (limit,),
-            ).fetchall()
-            conn.close()
-        except Exception:
-            return {"vouchers": [], "error": "tracker.db no disponible"}
-        result = []
-        for r in rows:
+            return {"vouchers": [], "total": 0}
+
+        conn = sqlite3.connect(f"file:{db_path}?immutable=1", uri=True)
+        conn.row_factory = sqlite3.Row
+
+        def _row_to_dict(r):
             ts_raw = r["processed_at"] or ""
-            # "YYYY-MM-DD HH:MM:SS" → date="MM-DD", ts="HH:MM:SS"
-            date_part = ts_raw[5:10] if len(ts_raw) >= 10 else ""
-            time_part = ts_raw[11:19] if len(ts_raw) >= 19 else ts_raw
-            result.append({
+            return {
                 "id": f"{r['filename']}:{r['row_index']}",
-                "date": date_part,
-                "ts": time_part,
+                "date": ts_raw[5:10] if len(ts_raw) >= 10 else "",
+                "ts": ts_raw[11:19] if len(ts_raw) >= 19 else ts_raw,
                 "supplier_code": r["supplier_code"] or "",
                 "voucher": r["booking_reference"] or "",
                 "currency": r["currency"] or "",
@@ -189,24 +175,65 @@ async def get_history(limit: int = 500):
                 "error": r["error"] or "",
                 "filename": r["filename"],
                 "source": "history",
-            })
-        return {"vouchers": result}
+            }
+
+        # Intento 1: query directa con ORDER BY (DB sana)
+        try:
+            rows = conn.execute(
+                "SELECT filename, row_index, booking_reference, supplier_code, currency, "
+                "status, error, processed_at "
+                "FROM processed_rows "
+                "WHERE status IN ('ok', 'failed', 'skipped') "
+                "ORDER BY processed_at DESC"
+            ).fetchall()
+            conn.close()
+            return {"vouchers": [_row_to_dict(r) for r in rows], "total": len(rows)}
+        except Exception:
+            pass
+
+        # Intento 2: scan por chunks sin ORDER BY (DB parcialmente corrupta)
+        result = []
+        CHUNK = 5000
+        offset = 0
+        while True:
+            try:
+                chunk = conn.execute(
+                    "SELECT filename, row_index, booking_reference, supplier_code, currency, "
+                    "status, error, processed_at "
+                    "FROM processed_rows "
+                    "WHERE status IN ('ok', 'failed', 'skipped') "
+                    "LIMIT ? OFFSET ?",
+                    (CHUNK, offset),
+                ).fetchall()
+            except Exception:
+                break
+            if not chunk:
+                break
+            result.extend(_row_to_dict(r) for r in chunk)
+            offset += CHUNK
+
+        conn.close()
+        return {"vouchers": result, "total": len(result)}
 
     return await run_in_threadpool(_fetch)
 
 
 @app.get("/api/report")
 async def get_report():
-    """Resumen agregado por proveedor desde tracker.db."""
+    """Resumen agregado por proveedor desde tracker.db.
+    Si el GROUP BY falla (DB corrupta), lee en chunks y agrega en Python."""
     def _fetch():
         import sqlite3
         db_path = BASE_DIR / "outputs" / "tracker.db"
         if not db_path.exists():
             return {"suppliers": [], "totals": {}}
+
+        conn = sqlite3.connect(f"file:{db_path}?immutable=1", uri=True)
+        conn.row_factory = sqlite3.Row
+
+        # Intento 1: GROUP BY en SQL (DB sana)
         try:
-            conn = sqlite3.connect(str(db_path))
-            conn.row_factory = sqlite3.Row
-            suppliers = conn.execute("""
+            rows = conn.execute("""
                 SELECT
                     supplier_code,
                     COUNT(*) AS total,
@@ -221,20 +248,60 @@ async def get_report():
                 GROUP BY supplier_code
                 ORDER BY total DESC
             """).fetchall()
-            totals = conn.execute("""
-                SELECT
-                    COUNT(*) AS total,
-                    SUM(CASE WHEN status='ok'      THEN 1 ELSE 0 END) AS ok,
-                    SUM(CASE WHEN status='failed'  THEN 1 ELSE 0 END) AS failed,
-                    SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END) AS skipped,
-                    SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
-                    COUNT(DISTINCT supplier_code) AS suppliers
-                FROM processed_rows
-            """).fetchone()
             conn.close()
+            suppliers = [dict(r) for r in rows]
         except Exception:
-            return {"suppliers": [], "totals": {}, "error": "tracker.db no disponible"}
-        return {"suppliers": [dict(r) for r in suppliers], "totals": dict(totals)}
+            # Intento 2: scan por chunks, agrega en Python (DB parcialmente corrupta)
+            agg: dict = {}
+            CHUNK = 5000
+            offset = 0
+            while True:
+                try:
+                    chunk = conn.execute(
+                        "SELECT supplier_code, currency, status, processed_at "
+                        "FROM processed_rows LIMIT ? OFFSET ?",
+                        (CHUNK, offset),
+                    ).fetchall()
+                except Exception:
+                    break
+                if not chunk:
+                    break
+                for r in chunk:
+                    sup = r["supplier_code"] or ""
+                    if not sup:
+                        continue
+                    if sup not in agg:
+                        agg[sup] = {"supplier_code": sup, "total": 0, "ok": 0,
+                                    "failed": 0, "skipped": 0, "pending": 0,
+                                    "currencies": set(), "last_processed": ""}
+                    e = agg[sup]
+                    e["total"] += 1
+                    st = r["status"] or "pending"
+                    if st in e:
+                        e[st] += 1
+                    if r["currency"]:
+                        e["currencies"].add(r["currency"])
+                    ts = r["processed_at"] or ""
+                    if ts > e["last_processed"]:
+                        e["last_processed"] = ts
+                offset += CHUNK
+            conn.close()
+            suppliers = sorted(
+                [
+                    {**s, "currencies": ",".join(sorted(s["currencies"]))}
+                    for s in agg.values()
+                ],
+                key=lambda x: x["total"],
+                reverse=True,
+            )
+
+        totals: dict = {"total": 0, "ok": 0, "failed": 0, "skipped": 0,
+                        "pending": 0, "suppliers": len(suppliers)}
+        for s in suppliers:
+            for k in ("total", "ok", "failed", "skipped", "pending"):
+                totals[k] += s.get(k, 0)
+
+        return {"suppliers": suppliers, "totals": totals}
 
     return await run_in_threadpool(_fetch)
 

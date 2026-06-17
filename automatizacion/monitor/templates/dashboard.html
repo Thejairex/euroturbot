@@ -103,7 +103,7 @@
 
   <section class="vouchers-section">
     <div class="vouchers-header">
-      <h2>Vouchers procesados <span class="voucher-count" id="voucherCount"></span></h2>
+      <h2>Vouchers procesados <span class="voucher-count" id="voucherCount"></span><span class="voucher-total-note" id="voucherTotalNote"></span></h2>
       <div class="voucher-filters">
         <label class="filter-toggle filter-ok active" id="filterOk"><input type="checkbox" checked> ✅ OK</label>
         <label class="filter-toggle filter-failed active" id="filterFailed"><input type="checkbox" checked> ❌ Fallidos</label>
@@ -415,9 +415,10 @@ const seenSeqs = new Set();
 // ── Vouchers ──────────────────────────────────────────────────────────────────
 const vouchersBody = $('vouchersBody');
 const voucherCount = $('voucherCount');
-const MAX_VOUCHER_ROWS = 500;
+const MAX_VOUCHER_ROWS = 5000;
 const seenVoucherKeys = new Set();  // "l:<seq>" para live, "h:<id>" para historial
 let totalVouchers = 0;
+let totalHistoryVouchers = 0;  // total real en DB (puede superar MAX_VOUCHER_ROWS)
 
 const filterState = { ok: true, failed: true, skipped: true };
 
@@ -439,7 +440,13 @@ $('btnClearVouchers').addEventListener('click', function() {
 });
 
 function updateVoucherCount() {
-  voucherCount.textContent = totalVouchers > 0 ? `(${totalVouchers})` : '';
+  voucherCount.textContent = totalVouchers > 0 ? `(${totalVouchers.toLocaleString()})` : '';
+  const note = $('voucherTotalNote');
+  if (totalHistoryVouchers > totalVouchers) {
+    note.textContent = ` — mostrando ${totalVouchers.toLocaleString()} de ${totalHistoryVouchers.toLocaleString()} históricos`;
+  } else {
+    note.textContent = '';
+  }
 }
 
 function applyVoucherFilter() {
@@ -709,8 +716,9 @@ $('btnLoadLogs').addEventListener('click', function() {
 
 async function loadHistory() {
   try {
-    const res = await fetch('/api/history?limit=500');
+    const res = await fetch('/api/history');
     const data = await res.json();
+    if (data.total) totalHistoryVouchers = data.total;
     if (data.vouchers && data.vouchers.length > 0) {
       appendHistoryVouchers(data.vouchers);
     }

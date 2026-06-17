@@ -264,6 +264,7 @@ main { max-width: 1200px; margin: 0 auto; padding: 2rem; }
 .voucher-ts { color: #64748b; font-size: 0.78rem; font-family: 'JetBrains Mono', 'Consolas', monospace; white-space: nowrap; }
 .voucher-number { font-family: 'JetBrains Mono', 'Consolas', monospace; font-size: 0.85rem; }
 .voucher-date { color: #475569; font-size: 0.72rem; }
+.voucher-total-note { color: #475569; font-size: 0.78rem; font-weight: 400; }
 
 .row-history td { opacity: 0.65; }
 .row-history:hover td { opacity: 0.9; transition: opacity 0.15s; }
