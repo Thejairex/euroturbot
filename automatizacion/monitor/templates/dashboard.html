@@ -150,6 +150,7 @@
     <h2>Archivos</h2>
     <div class="files-info" id="filesInfo">
       <span class="badge" id="pendingBadge">📁 Pendientes: 0</span>
+      <button id="btnReport" class="btn btn-small btn-primary">📊 Reporte proveedores</button>
       <button id="btnResetAll" class="btn btn-small btn-danger">🗑 Resetear todo</button>
     </div>
     <table id="filesTable">
@@ -178,6 +179,40 @@
     <div id="eventFeed" class="event-feed"><div class="log-empty">Esperando actividad...</div></div>
   </section>
 </main>
+
+<!-- Modal: Reporte de proveedores -->
+<div id="reportModal" class="modal-overlay" style="display:none">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2>📊 Reporte de proveedores</h2>
+      <button id="btnCloseReport" class="btn btn-tiny btn-secondary">✕ Cerrar</button>
+    </div>
+    <div class="modal-summary" id="reportSummary"></div>
+    <div class="modal-actions">
+      <a id="btnDownloadCsv" href="/api/report/csv" class="btn btn-small btn-success" download>⬇ Descargar CSV</a>
+      <input type="text" id="reportFilter" class="input-sm" placeholder="Filtrar proveedor..." style="width:200px">
+    </div>
+    <div class="modal-table-wrap">
+      <table id="reportTable">
+        <thead>
+          <tr>
+            <th>Proveedor</th>
+            <th>Total</th>
+            <th>✅ OK</th>
+            <th>❌ Fallidos</th>
+            <th>⏭ Saltados</th>
+            <th>⏳ Pendientes</th>
+            <th>Monedas</th>
+            <th>Último proceso</th>
+          </tr>
+        </thead>
+        <tbody id="reportBody">
+          <tr><td colspan="8" class="empty">Cargando...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -680,6 +715,78 @@ async function loadHistory() {
       appendHistoryVouchers(data.vouchers);
     }
   } catch (e) {}
+}
+
+// ── Reporte de proveedores ────────────────────────────────────────────────────
+let reportData = [];
+
+$('btnReport').addEventListener('click', async function() {
+  const btn = this;
+  btn.textContent = '⏳ Cargando...';
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/report');
+    const data = await res.json();
+    if (data.error && !data.suppliers.length) {
+      alert('No hay datos disponibles: ' + data.error);
+      return;
+    }
+    reportData = data.suppliers || [];
+    renderReport(reportData, data.totals || {});
+    $('reportModal').style.display = 'flex';
+  } catch (e) {
+    alert('Error al generar reporte');
+  } finally {
+    btn.textContent = '📊 Reporte proveedores';
+    btn.disabled = false;
+  }
+});
+
+$('btnCloseReport').addEventListener('click', () => {
+  $('reportModal').style.display = 'none';
+});
+$('reportModal').addEventListener('click', function(e) {
+  if (e.target === this) this.style.display = 'none';
+});
+
+$('reportFilter').addEventListener('input', function() {
+  const q = this.value.toLowerCase().trim();
+  renderReportRows(q ? reportData.filter(s => (s.supplier_code || '').toLowerCase().includes(q)) : reportData);
+});
+
+function renderReport(suppliers, totals) {
+  $('reportSummary').innerHTML = `
+    <span class="badge">🏢 ${(totals.suppliers || 0).toLocaleString()} proveedores</span>
+    <span class="badge">📄 ${(totals.total || 0).toLocaleString()} vouchers</span>
+    <span class="badge status-ok">✅ ${(totals.ok || 0).toLocaleString()} OK</span>
+    <span class="badge status-failed">❌ ${(totals.failed || 0).toLocaleString()} fallidos</span>
+    <span class="badge status-skipped">⏭ ${(totals.skipped || 0).toLocaleString()} saltados</span>
+    <span class="badge status-pending">⏳ ${(totals.pending || 0).toLocaleString()} pendientes</span>
+  `;
+  renderReportRows(suppliers);
+}
+
+function renderReportRows(suppliers) {
+  const tbody = $('reportBody');
+  tbody.innerHTML = '';
+  if (!suppliers.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty">Sin datos</td></tr>';
+    return;
+  }
+  suppliers.forEach(s => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><strong>${escapeHtml(s.supplier_code || '-')}</strong></td>
+      <td>${(s.total || 0).toLocaleString()}</td>
+      <td class="status-ok">${(s.ok || 0).toLocaleString()}</td>
+      <td class="status-failed">${(s.failed || 0).toLocaleString()}</td>
+      <td class="status-skipped">${(s.skipped || 0).toLocaleString()}</td>
+      <td class="status-pending">${(s.pending || 0).toLocaleString()}</td>
+      <td>${escapeHtml(s.currencies || '-')}</td>
+      <td class="voucher-ts">${escapeHtml((s.last_processed || '').substring(0, 16))}</td>
+    `;
+    tbody.appendChild(tr);
+  });
 }
 
 // Arrancar SSE, tracker e historial al cargar

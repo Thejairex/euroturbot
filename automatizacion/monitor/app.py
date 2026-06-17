@@ -195,6 +195,85 @@ async def get_history(limit: int = 500):
     return await run_in_threadpool(_fetch)
 
 
+@app.get("/api/report")
+async def get_report():
+    """Resumen agregado por proveedor desde tracker.db."""
+    def _fetch():
+        import sqlite3
+        db_path = BASE_DIR / "outputs" / "tracker.db"
+        if not db_path.exists():
+            return {"suppliers": [], "totals": {}}
+        try:
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            suppliers = conn.execute("""
+                SELECT
+                    supplier_code,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN status='ok'      THEN 1 ELSE 0 END) AS ok,
+                    SUM(CASE WHEN status='failed'  THEN 1 ELSE 0 END) AS failed,
+                    SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END) AS skipped,
+                    SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
+                    GROUP_CONCAT(DISTINCT currency) AS currencies,
+                    MAX(processed_at) AS last_processed
+                FROM processed_rows
+                WHERE supplier_code IS NOT NULL AND supplier_code != ''
+                GROUP BY supplier_code
+                ORDER BY total DESC
+            """).fetchall()
+            totals = conn.execute("""
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN status='ok'      THEN 1 ELSE 0 END) AS ok,
+                    SUM(CASE WHEN status='failed'  THEN 1 ELSE 0 END) AS failed,
+                    SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END) AS skipped,
+                    SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
+                    COUNT(DISTINCT supplier_code) AS suppliers
+                FROM processed_rows
+            """).fetchone()
+            conn.close()
+        except Exception:
+            return {"suppliers": [], "totals": {}, "error": "tracker.db no disponible"}
+        return {"suppliers": [dict(r) for r in suppliers], "totals": dict(totals)}
+
+    return await run_in_threadpool(_fetch)
+
+
+@app.get("/api/report/csv")
+async def get_report_csv():
+    """Descarga el reporte de proveedores como CSV (UTF-8 con BOM para Excel)."""
+    import csv
+    import io
+    from datetime import date
+    from fastapi.responses import StreamingResponse as SR
+
+    data = await get_report()
+
+    def generate():
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["Proveedor", "Total", "OK", "Fallidos", "Saltados", "Pendientes", "Monedas", "Último proceso"])
+        for s in data.get("suppliers", []):
+            w.writerow([
+                s["supplier_code"],
+                s["total"],
+                s["ok"],
+                s["failed"],
+                s["skipped"],
+                s["pending"],
+                s["currencies"] or "",
+                (s["last_processed"] or "")[:16],
+            ])
+        yield buf.getvalue().encode("utf-8-sig")
+
+    fname = f"reporte_proveedores_{date.today().strftime('%Y%m%d')}.csv"
+    return SR(
+        generate(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={fname}"},
+    )
+
+
 @app.post("/api/tracker/reset")
 async def reset_tracker(file: str = "", all: bool = False):
     def _reset():
