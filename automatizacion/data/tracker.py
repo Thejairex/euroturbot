@@ -1,24 +1,76 @@
 import hashlib
-import sqlite3
 import time
 from pathlib import Path
 from typing import Any
 
-from config.settings import BASE_DIR
+from config.settings import (
+    BASE_DIR,
+    DB_CONNECTION,
+    DB_HOST,
+    DB_PORT,
+    DB_DATABASE,
+    DB_USERNAME,
+    DB_PASSWORD,
+)
 
 
 class ProcessTracker:
     def __init__(self, db_path: str | Path | None = None):
-        if db_path is None:
-            db_path = BASE_DIR / "outputs" / "tracker.db"
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path))
-        self._conn.row_factory = sqlite3.Row
+        self._db_type = "pgsql" if DB_CONNECTION == "pgsql" else "sqlite"
+
+        if self._db_type == "pgsql":
+            import psycopg2
+            import psycopg2.extras
+
+            self._conn = psycopg2.connect(
+                host=DB_HOST,
+                port=int(DB_PORT),
+                dbname=DB_DATABASE,
+                user=DB_USERNAME,
+                password=DB_PASSWORD,
+                cursor_factory=psycopg2.extras.RealDictCursor,
+            )
+            self._conn.autocommit = False
+        else:
+            import sqlite3
+
+            if db_path is None:
+                db_path = BASE_DIR / "outputs" / "tracker.db"
+            self.db_path = Path(db_path)
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(str(self.db_path))
+            self._conn.row_factory = sqlite3.Row
+
         self._init_db()
 
+    # ── Helpers de ejecución ──────────────────────────────────────────────────
+
+    def _execute(self, sql: str, params=None):
+        """Ejecuta SQL usando %s como placeholder (se convierte a ? en SQLite)."""
+        if self._db_type == "sqlite":
+            return self._conn.execute(sql.replace("%s", "?"), params or ())
+        cur = self._conn.cursor()
+        cur.execute(sql, params or ())
+        return cur
+
+    def _executemany(self, sql: str, data):
+        if self._db_type == "sqlite":
+            return self._conn.executemany(sql.replace("%s", "?"), data)
+        cur = self._conn.cursor()
+        cur.executemany(sql, data)
+        return cur
+
+    def _fetchone(self, sql: str, params=None):
+        return self._execute(sql, params).fetchone()
+
+    def _fetchall(self, sql: str, params=None):
+        return self._execute(sql, params).fetchall()
+
+    # ── Inicialización del esquema ────────────────────────────────────────────
+
     def _init_db(self):
-        self._conn.executescript("""
+        stmts = [
+            """
             CREATE TABLE IF NOT EXISTS processed_files (
                 filename TEXT PRIMARY KEY,
                 file_hash TEXT NOT NULL,
@@ -29,8 +81,9 @@ class ProcessTracker:
                 error TEXT,
                 started_at TEXT,
                 finished_at TEXT
-            );
-
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS processed_rows (
                 filename TEXT NOT NULL,
                 row_index INTEGER NOT NULL,
@@ -41,16 +94,35 @@ class ProcessTracker:
                 error TEXT,
                 processed_at TEXT,
                 PRIMARY KEY (filename, row_index)
-            );
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_rows_status ON processed_rows(filename, status)",
+        ]
 
-            CREATE INDEX IF NOT EXISTS idx_rows_status ON processed_rows(filename, status);
-        """)
-        # Migración para BDs existentes: agregar columnas nuevas si faltan
-        existing = {r["name"] for r in self._conn.execute("PRAGMA table_info(processed_rows)")}
+        if self._db_type == "pgsql":
+            cur = self._conn.cursor()
+            for s in stmts:
+                cur.execute(s)
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'processed_rows' AND table_schema = 'public'"
+            )
+            existing = {r["column_name"] for r in cur.fetchall()}
+        else:
+            for s in stmts:
+                self._conn.execute(s)
+            existing = {
+                r["name"]
+                for r in self._conn.execute("PRAGMA table_info(processed_rows)")
+            }
+
         for col in ("supplier_code", "currency"):
             if col not in existing:
-                self._conn.execute(f"ALTER TABLE processed_rows ADD COLUMN {col} TEXT")
+                self._execute(f"ALTER TABLE processed_rows ADD COLUMN {col} TEXT")
+
         self._conn.commit()
+
+    # ── Utilidades ────────────────────────────────────────────────────────────
 
     @staticmethod
     def file_hash(filepath: str | Path) -> str:
@@ -60,43 +132,58 @@ class ProcessTracker:
                 h.update(chunk)
         return h.hexdigest()
 
-    # ── File tracking ──
+    # ── Tracking de archivos ──────────────────────────────────────────────────
 
     def get_file_status(self, filename: str) -> dict | None:
-        cur = self._conn.execute(
-            "SELECT * FROM processed_files WHERE filename = ?", (filename,)
+        row = self._fetchone(
+            "SELECT * FROM processed_files WHERE filename = %s", (filename,)
         )
-        row = cur.fetchone()
         return dict(row) if row else None
 
     def mark_file_pending(self, filename: str, file_hash: str, total_rows: int):
-        self._conn.execute(
-            "INSERT OR REPLACE INTO processed_files (filename, file_hash, status, total_rows, started_at) "
-            "VALUES (?, ?, 'pending', ?, ?)",
-            (filename, file_hash, total_rows, time.strftime("%Y-%m-%d %H:%M:%S")),
-        )
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        if self._db_type == "pgsql":
+            self._execute(
+                "INSERT INTO processed_files "
+                "(filename, file_hash, status, total_rows, started_at) "
+                "VALUES (%s, %s, 'pending', %s, %s) "
+                "ON CONFLICT (filename) DO UPDATE SET "
+                "file_hash = EXCLUDED.file_hash, status = 'pending', "
+                "total_rows = EXCLUDED.total_rows, started_at = EXCLUDED.started_at",
+                (filename, file_hash, total_rows, now),
+            )
+        else:
+            self._execute(
+                "INSERT OR REPLACE INTO processed_files "
+                "(filename, file_hash, status, total_rows, started_at) "
+                "VALUES (%s, %s, 'pending', %s, %s)",
+                (filename, file_hash, total_rows, now),
+            )
         self._conn.commit()
 
     def mark_file_processing(self, filename: str):
-        self._conn.execute(
-            "UPDATE processed_files SET status = 'processing', started_at = ? WHERE filename = ?",
+        self._execute(
+            "UPDATE processed_files SET status = 'processing', started_at = %s "
+            "WHERE filename = %s",
             (time.strftime("%Y-%m-%d %H:%M:%S"), filename),
         )
         self._conn.commit()
 
     def mark_file_completed(self, filename: str, error: str | None = None):
-        ok = self._conn.execute(
-            "SELECT COUNT(*) FROM processed_rows WHERE filename = ? AND status = 'ok'",
+        ok = self._fetchone(
+            "SELECT COUNT(*) AS cnt FROM processed_rows "
+            "WHERE filename = %s AND status = 'ok'",
             (filename,),
-        ).fetchone()[0]
-        failed = self._conn.execute(
-            "SELECT COUNT(*) FROM processed_rows WHERE filename = ? AND status = 'failed'",
+        )["cnt"]
+        failed = self._fetchone(
+            "SELECT COUNT(*) AS cnt FROM processed_rows "
+            "WHERE filename = %s AND status = 'failed'",
             (filename,),
-        ).fetchone()[0]
+        )["cnt"]
         status = "failed" if error else "completed"
-        self._conn.execute(
-            "UPDATE processed_files SET status = ?, ok_rows = ?, failed_rows = ?, error = ?, finished_at = ? "
-            "WHERE filename = ?",
+        self._execute(
+            "UPDATE processed_files SET status = %s, ok_rows = %s, failed_rows = %s, "
+            "error = %s, finished_at = %s WHERE filename = %s",
             (status, ok, failed, error, time.strftime("%Y-%m-%d %H:%M:%S"), filename),
         )
         self._conn.commit()
@@ -120,117 +207,134 @@ class ProcessTracker:
                 result.append(f)
         return result
 
-    # ── Row tracking ──
+    # ── Tracking de filas ─────────────────────────────────────────────────────
 
     def init_rows(self, filename: str, rows: list[dict[str, Any]]):
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         data = [
             (
-                filename, i,
+                filename,
+                i,
                 r.get("Voucher_Number", ""),
                 (r.get("Supplier_Code") or "").strip(),
                 (r.get("Service_Cost_Currency") or "").strip(),
-                "pending", None, now,
+                "pending",
+                None,
+                now,
             )
             for i, r in enumerate(rows)
         ]
-        self._conn.executemany(
-            "INSERT OR IGNORE INTO processed_rows "
-            "(filename, row_index, booking_reference, supplier_code, currency, status, error, processed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            data,
-        )
+        if self._db_type == "pgsql":
+            self._executemany(
+                "INSERT INTO processed_rows "
+                "(filename, row_index, booking_reference, supplier_code, currency, "
+                "status, error, processed_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (filename, row_index) DO NOTHING",
+                data,
+            )
+        else:
+            self._executemany(
+                "INSERT OR IGNORE INTO processed_rows "
+                "(filename, row_index, booking_reference, supplier_code, currency, "
+                "status, error, processed_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                data,
+            )
         self._conn.commit()
 
-    def get_pending_rows(self, filename: str) -> list[sqlite3.Row]:
-        cur = self._conn.execute(
-            "SELECT * FROM processed_rows WHERE filename = ? AND status = 'pending' ORDER BY row_index",
+    def get_pending_rows(self, filename: str) -> list:
+        return self._fetchall(
+            "SELECT * FROM processed_rows WHERE filename = %s AND status = 'pending' "
+            "ORDER BY row_index",
             (filename,),
         )
-        return cur.fetchall()
 
     def mark_row_processing(self, filename: str, row_index: int):
-        self._conn.execute(
-            "UPDATE processed_rows SET status = 'processing' WHERE filename = ? AND row_index = ?",
+        self._execute(
+            "UPDATE processed_rows SET status = 'processing' "
+            "WHERE filename = %s AND row_index = %s",
             (filename, row_index),
         )
         self._conn.commit()
 
     def mark_row_ok(self, filename: str, row_index: int):
-        self._conn.execute(
-            "UPDATE processed_rows SET status = 'ok', processed_at = ? WHERE filename = ? AND row_index = ?",
+        self._execute(
+            "UPDATE processed_rows SET status = 'ok', processed_at = %s "
+            "WHERE filename = %s AND row_index = %s",
             (time.strftime("%Y-%m-%d %H:%M:%S"), filename, row_index),
         )
         self._conn.commit()
 
     def mark_row_failed(self, filename: str, row_index: int, error: str):
-        self._conn.execute(
-            "UPDATE processed_rows SET status = 'failed', error = ?, processed_at = ? WHERE filename = ? AND row_index = ?",
+        self._execute(
+            "UPDATE processed_rows SET status = 'failed', error = %s, processed_at = %s "
+            "WHERE filename = %s AND row_index = %s",
             (error, time.strftime("%Y-%m-%d %H:%M:%S"), filename, row_index),
         )
         self._conn.commit()
 
     def mark_row_skipped(self, filename: str, row_index: int):
-        """Marca una fila como no procesable (ej. MEP) para que no cuente como pendiente."""
-        self._conn.execute(
-            "UPDATE processed_rows SET status = 'skipped', processed_at = ? WHERE filename = ? AND row_index = ?",
+        self._execute(
+            "UPDATE processed_rows SET status = 'skipped', processed_at = %s "
+            "WHERE filename = %s AND row_index = %s",
             (time.strftime("%Y-%m-%d %H:%M:%S"), filename, row_index),
         )
         self._conn.commit()
 
     def mark_rows_skipped_bulk(self, filename: str, row_indices: list[int]):
-        """Marca múltiples filas como skipped en una sola transacción."""
         if not row_indices:
             return
         now = time.strftime("%Y-%m-%d %H:%M:%S")
-        self._conn.executemany(
-            "UPDATE processed_rows SET status = 'skipped', processed_at = ? WHERE filename = ? AND row_index = ?",
+        self._executemany(
+            "UPDATE processed_rows SET status = 'skipped', processed_at = %s "
+            "WHERE filename = %s AND row_index = %s",
             [(now, filename, idx) for idx in row_indices],
         )
         self._conn.commit()
 
     def mark_row_pending(self, filename: str, row_index: int):
-        """Vuelve una fila a 'pending' (para reintento tras abortar un grupo)."""
-        self._conn.execute(
-            "UPDATE processed_rows SET status = 'pending', error = NULL WHERE filename = ? AND row_index = ?",
+        self._execute(
+            "UPDATE processed_rows SET status = 'pending', error = NULL "
+            "WHERE filename = %s AND row_index = %s",
             (filename, row_index),
         )
         self._conn.commit()
 
     def reset_processing_to_pending(self, filename: str) -> int:
-        """Vuelve a 'pending' las filas que quedaron en 'processing' (grupos cortados por una caída)."""
-        cur = self._conn.execute(
-            "UPDATE processed_rows SET status = 'pending' WHERE filename = ? AND status = 'processing'",
+        cur = self._execute(
+            "UPDATE processed_rows SET status = 'pending' "
+            "WHERE filename = %s AND status = 'processing'",
             (filename,),
         )
         self._conn.commit()
         return cur.rowcount
 
     def get_row(self, filename: str, row_index: int) -> dict | None:
-        cur = self._conn.execute(
-            "SELECT * FROM processed_rows WHERE filename = ? AND row_index = ?",
+        row = self._fetchone(
+            "SELECT * FROM processed_rows WHERE filename = %s AND row_index = %s",
             (filename, row_index),
         )
-        row = cur.fetchone()
         return dict(row) if row else None
 
-    # ── Management ──
+    # ── Gestión general ───────────────────────────────────────────────────────
 
     def get_summary(self) -> list[dict]:
-        cur = self._conn.execute(
-            "SELECT filename, status, total_rows, ok_rows, failed_rows, error, started_at, finished_at "
+        rows = self._fetchall(
+            "SELECT filename, status, total_rows, ok_rows, failed_rows, error, "
+            "started_at, finished_at "
             "FROM processed_files ORDER BY started_at DESC"
         )
-        return [dict(r) for r in cur.fetchall()]
+        return [dict(r) for r in rows]
 
     def reset_file(self, filename: str):
-        self._conn.execute("DELETE FROM processed_rows WHERE filename = ?", (filename,))
-        self._conn.execute("DELETE FROM processed_files WHERE filename = ?", (filename,))
+        self._execute("DELETE FROM processed_rows WHERE filename = %s", (filename,))
+        self._execute("DELETE FROM processed_files WHERE filename = %s", (filename,))
         self._conn.commit()
 
     def reset_all(self):
-        self._conn.execute("DELETE FROM processed_rows")
-        self._conn.execute("DELETE FROM processed_files")
+        self._execute("DELETE FROM processed_rows")
+        self._execute("DELETE FROM processed_files")
         self._conn.commit()
 
     def close(self):

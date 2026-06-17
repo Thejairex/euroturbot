@@ -13,12 +13,11 @@ from modules.transaction_creator import (
     create_transaction,
     create_bulk_transaction,
     confirm_bulk_transaction,
-    add_voucher_line,
-    exit_invoice_line,
+    add_vouchers_via_search,
     read_invoice_totals,
     save_invoice,
     abort_transaction,
-    InvalidAccountError,
+    VoucherSearchTimeout,
 )
 from utils.logger import log
 
@@ -177,6 +176,8 @@ def process_supplier_group(
 
     group_ok = True
     group_error = None
+    group_timeout = False
+    per_row_status: dict[int, str] = {}
 
     try:
         open_supplier(page, supplier_code)
@@ -194,8 +195,8 @@ def process_supplier_group(
             records_for_currency = [rec for rec in records if rec["currency"] == currency]
             vouchers_for_currency = [rec["voucher"] for rec in records_for_currency]
             reference = f"INV{records_for_currency[0]['row_index']}{supplier_code}"
-            log.info("    Moneda %s: total=%.2f, ref=%s, %d vouchers: %s",
-                     currency, total, reference, len(records_for_currency), vouchers_for_currency)
+            log.info("    Moneda %s: total=%.2f, ref=%s, %d vouchers",
+                     currency, total, reference, len(records_for_currency))
 
             stats.set_activity(currency=currency, voucher_total=len(records_for_currency), voucher_idx=0)
 
@@ -203,41 +204,51 @@ def process_supplier_group(
             create_bulk_transaction(page, total, currency, reference)
             confirm_bulk_transaction(page)
 
-            skipped_vouchers: list[str] = []
-            for i, rec in enumerate(records_for_currency):
-                # Chequear stop dentro del loop de vouchers (INSERT modal abierto → abortar)
-                if stop_event and stop_event.is_set():
-                    try:
-                        abort_transaction(page)
-                    except Exception:
-                        pass
-                    try:
-                        exit_supplier(page)
-                    except Exception:
-                        pass
-                    raise PipelineStopped()
+            # Calcular rango VOUCHER FROM/TO para acotar la búsqueda en el servidor
+            try:
+                nums = [int(v.replace(",", "")) for v in vouchers_for_currency
+                        if str(v).replace(",", "").isdigit()]
+                vfrom = str(min(nums)) if nums else None
+                vto = str(max(nums)) if nums else None
+            except Exception:
+                vfrom = vto = None
 
-                voucher = rec["voucher"]
-                stats.set_activity(voucher=voucher, voucher_idx=i + 1)
+            # Carga masiva vía modal "Select Vouchers" (lupa)
+            try:
+                result = add_vouchers_via_search(page, vouchers_for_currency, vfrom, vto)
+            except VoucherSearchTimeout:
+                log.warning("    VoucherSearchTimeout %s/%s → oversized", supplier_code, currency)
                 try:
-                    add_voucher_line(page, voucher, is_first=(i == 0))
-                    stats.add_voucher_result({
-                        "filename": filename, "supplier_code": supplier_code,
-                        "voucher": voucher, "currency": currency,
-                        "status": "ok", "error": None, "row_index": rec["row_index"],
+                    abort_transaction(page)
+                except Exception:
+                    pass
+                if oversized_report is not None:
+                    oversized_report.append({
+                        "filename": filename,
+                        "supplier_code": supplier_code,
+                        "supplier_name": group.get("supplier_name", ""),
+                        "voucher_count": group["size"],
+                        "currencies": ", ".join(group["total_by_currency"].keys()),
+                        "totals": "; ".join(f"{c}={t:.2f}" for c, t in group["total_by_currency"].items()),
                     })
-                except InvalidAccountError as e:
-                    log.warning("    Voucher %s saltado — cuenta inválida: %s", voucher, e)
-                    exit_invoice_line(page)
-                    skipped_vouchers.append(voucher)
+                group_ok = False
+                group_timeout = True
+                group_error = f"VoucherSearchTimeout ({currency})"
+                break
+
+            # Registrar resultado por fila
+            not_found_set = {str(v).replace(",", "") for v in result["not_found"]}
+            for rec in records_for_currency:
+                norm = str(rec["voucher"]).replace(",", "")
+                if norm in not_found_set:
                     entry = {
                         "filename": filename,
                         "supplier_code": supplier_code,
                         "supplier_name": group.get("supplier_name", ""),
                         "currency": currency,
-                        "voucher": e.voucher or voucher,
-                        "account": e.account or "?",
-                        "reason": str(e),
+                        "voucher": rec["voucher"],
+                        "account": "no_encontrado",
+                        "reason": "Voucher no encontrado en TourplanNX (lupa)",
                         "row_index": rec["row_index"],
                     }
                     if skipped_report is not None:
@@ -245,29 +256,37 @@ def process_supplier_group(
                     stats.add_skipped(entry)
                     stats.add_voucher_result({
                         "filename": filename, "supplier_code": supplier_code,
-                        "voucher": entry["voucher"], "currency": currency,
+                        "voucher": rec["voucher"], "currency": currency,
                         "status": "skipped", "error": entry["reason"], "row_index": rec["row_index"],
                     })
+                    per_row_status[rec["row_index"]] = "skipped"
+                else:
+                    stats.add_voucher_result({
+                        "filename": filename, "supplier_code": supplier_code,
+                        "voucher": rec["voucher"], "currency": currency,
+                        "status": "ok", "error": None, "row_index": rec["row_index"],
+                    })
+                    per_row_status[rec["row_index"]] = "ok"
 
-            loaded_count = len(vouchers_for_currency) - len(skipped_vouchers)
+            loaded_count = len(result["loaded"])
 
             if loaded_count == 0:
-                log.warning("    Todos los vouchers de %s/%s saltados — abortando", supplier_code, currency)
+                log.warning("    Ningún voucher cargado para %s/%s — abortando", supplier_code, currency)
                 abort_transaction(page)
                 group_ok = False
-                group_error = f"Todos los vouchers con cuenta inválida ({currency})"
+                group_error = f"Ningún voucher encontrado en lupa ({currency})"
             else:
+                if result["not_found"]:
+                    log.warning("    %d/%d vouchers no encontrados en lupa: %s",
+                                len(result["not_found"]), len(vouchers_for_currency), result["not_found"])
+
                 totals = read_invoice_totals(page)
                 remainder = abs(totals.get("remainder", 9999))
-
-                if skipped_vouchers:
-                    log.warning("    %d/%d vouchers cargados (saltados por cuenta inválida: %s)",
-                                loaded_count, len(vouchers_for_currency), skipped_vouchers)
 
                 if remainder < 0.01:
                     log.info("    Totales cuadran: %s %s — REMAINDER=%.2f", supplier_code, currency, remainder)
                 else:
-                    log.warning("    REMAINDER=%.4f para %s %s — guardando igual (discrepancia/salteados)",
+                    log.warning("    REMAINDER=%.4f para %s %s — guardando igual",
                                 totals.get("remainder", "?"), supplier_code, currency)
 
                 save_invoice(page)
@@ -284,11 +303,24 @@ def process_supplier_group(
             abort_transaction(page)
         except Exception:
             pass
+        try:
+            exit_supplier(page)
+        except Exception:
+            pass
 
-    if group_ok:
+    if group_timeout:
+        if tracker:
+            tracker.mark_rows_skipped_bulk(filename, all_indices)
+        log.warning("  Proveedor %s marcado oversized por timeout (%d filas skipped)",
+                    supplier_code, len(all_indices))
+    elif group_ok:
         for idx in all_indices:
+            status = per_row_status.get(idx, "ok")
             if tracker:
-                tracker.mark_row_ok(filename, idx)
+                if status == "skipped":
+                    tracker.mark_row_skipped(filename, idx)
+                else:
+                    tracker.mark_row_ok(filename, idx)
         log.info("  Proveedor %s masivo completado (%d filas)", supplier_code, len(all_indices))
     else:
         for idx in all_indices:
@@ -368,8 +400,16 @@ def run_pipeline(
 
         if test_config and test_config.get("test"):
             supplier_filter = test_config.get("supplier")
+            suppliers_filter = test_config.get("suppliers")
             row_filter = test_config.get("row")
-            if supplier_filter:
+            if suppliers_filter:
+                pending_rows = [
+                    r for r in pending_rows
+                    if (rows[r["row_index"]].get("Supplier_Code") or "").strip() in suppliers_filter
+                ]
+                if not pending_rows:
+                    log.warning("  Ningún proveedor de %s encontrado o ya procesado", suppliers_filter)
+            elif supplier_filter:
                 pending_rows = [
                     r for r in pending_rows
                     if (rows[r["row_index"]].get("Supplier_Code") or "").strip() == supplier_filter

@@ -36,3 +36,13 @@ MAX_RETRIES = 3
 # Proveedores con más de N vouchers (no-MEP) se saltan en la corrida masiva y se
 # reportan aparte (entidades internas tipo 1EURO1/1ING01, inviables por UI).
 MAX_VOUCHERS_PER_SUPPLIER = 500
+
+# ── Base de datos ─────────────────────────────────────────────────────────────
+# DB_CONNECTION=pgsql  →  PostgreSQL vía psycopg2
+# DB_CONNECTION=sqlite (default)  →  SQLite local en outputs/tracker.db
+DB_CONNECTION = os.getenv("DB_CONNECTION", "sqlite")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_DATABASE = os.getenv("DB_DATABASE", "euroturbot")
+DB_USERNAME = os.getenv("DB_USERNAME", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")

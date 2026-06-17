@@ -19,6 +19,11 @@ class InvalidAccountError(Exception):
         self.account = account
 
 
+class VoucherSearchTimeout(Exception):
+    """El servidor TourplanNX expiró al buscar vouchers (proveedor con demasiados pendientes)."""
+    pass
+
+
 def _wait_for_spinner(page: Page) -> None:
     try:
         page.locator(".spinner").wait_for(state="visible", timeout=3000)
@@ -270,6 +275,187 @@ def exit_invoice_line(page: Page) -> None:
     except Exception:
         pass
     log.info("    Invoice Line cerrada (saltada)")
+
+
+def _set_voucher_range(page: Page, voucher_from: str | None, voucher_to: str | None) -> None:
+    """Setea VOUCHER FROM/TO en la pestaña SELECTION del modal Select Vouchers activo."""
+    page.evaluate("""
+        ([vFrom, vTo]) => {
+            // El modal Select Vouchers es el último dialog abierto
+            const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
+            const modal = dialogs[dialogs.length - 1];
+            if (!modal) return;
+            // Inputs editables numéricos del modal (VOUCHER FROM = [0], VOUCHER TO = [1])
+            const inputs = Array.from(modal.querySelectorAll('input')).filter(
+                i => !i.readOnly && !i.disabled
+                  && Array.from(i.classList).some(c => c.includes('tpnumber'))
+            );
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            const fire = (el, val) => {
+                setter.call(el, val);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            };
+            if (vFrom && inputs[0]) fire(inputs[0], vFrom);
+            if (vTo   && inputs[1]) fire(inputs[1], vTo);
+        }
+    """, [voucher_from, voucher_to])
+    log.info("    Rango vouchers: FROM=%s TO=%s", voucher_from, voucher_to)
+
+
+def _check_voucher_search_error(page: Page) -> None:
+    """Detecta un error de timeout del servidor tras SEARCH y lanza VoucherSearchTimeout."""
+    error_text = page.evaluate("""
+        () => {
+            const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
+            for (const d of dialogs) {
+                const t = d.textContent || '';
+                if (t.includes('GetVoucherDetails') || t.includes('An error has occurred')) {
+                    return t.substring(0, 120).trim();
+                }
+            }
+            return null;
+        }
+    """)
+    if not error_text:
+        return
+    try:
+        page.evaluate("""
+            () => {
+                const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
+                for (const d of dialogs) {
+                    const t = d.textContent || '';
+                    if (t.includes('GetVoucherDetails') || t.includes('An error has occurred')) {
+                        const btn = d.querySelector('button');
+                        if (btn) { btn.click(); return true; }
+                    }
+                }
+                return false;
+            }
+        """)
+    except Exception:
+        pass
+    raise VoucherSearchTimeout(f"TourplanNX timeout al buscar vouchers: {error_text}")
+
+
+def add_vouchers_via_search(
+    page: Page,
+    vouchers: list[str],
+    voucher_from: str | None = None,
+    voucher_to: str | None = None,
+) -> dict:
+    """Carga múltiples vouchers usando el modal 'Select Vouchers' (lupa).
+
+    Abre el modal desde la Invoice Line activa, aplica filtro VOUCHER FROM/TO,
+    ejecuta SEARCH, selecciona solo las filas del Excel y confirma con OK.
+
+    Raises:
+        VoucherSearchTimeout: si el servidor TourplanNX expira durante SEARCH.
+
+    Returns:
+        {"loaded": [vouchers cargados], "not_found": [vouchers del Excel no hallados en lupa]}
+    """
+    target = {str(v).replace(",", "").strip() for v in vouchers if str(v).strip()}
+
+    # 1. Click botón lupa ("Search for Voucher") desde la Invoice Line activa
+    invoice_line = page.get_by_role("dialog").last
+    lupa = invoice_line.get_by_role("button", name="Search for Voucher")
+    lupa.wait_for(state="visible", timeout=MODAL_TIMEOUT)
+    lupa.click()
+    log.info("    Select Vouchers: abriendo modal (lupa)...")
+
+    # 2. Esperar el modal Select Vouchers
+    sv = page.get_by_role("dialog").filter(has_text="Select Vouchers")
+    sv.wait_for(state="visible", timeout=MODAL_TIMEOUT)
+
+    # 3. Setear rango VOUCHER FROM/TO para acotar la búsqueda en el servidor
+    if voucher_from or voucher_to:
+        _set_voucher_range(page, voucher_from, voucher_to)
+
+    # 4. Click SEARCH (button.tpsearch — evita ambigüedad con "Search for Supplier")
+    sv.locator("button.tpsearch").click()
+    log.info("    SEARCH ejecutado (FROM=%s TO=%s)...", voucher_from, voucher_to)
+    page.wait_for_timeout(1500)
+
+    # 5. Esperar respuesta; detectar error de timeout del servidor
+    _wait_for_spinner(page)
+    _check_voucher_search_error(page)
+    # Esperar que las filas sean interactivas antes de leer o clickear
+    try:
+        page.locator("tr.tpgrid td.tpcol-vouchernumber").first.wait_for(state="visible", timeout=5000)
+    except Exception:
+        pass
+    page.wait_for_timeout(500)
+
+    # 6. Obtener la lista de vouchers en la tabla de RESULTS, con su índice global en tr.tpgrid.
+    # Las filas son tr.tpgrid dentro de <tp-tab> (NO dentro de dialog[open]).
+    # Se devuelve {index, voucher} para que el click Python use el índice correcto de la página
+    # (puede haber otros tr.tpgrid sin checkbox en el DOM, como el grid de Invoice Lines).
+    rows_data: list[dict] = page.evaluate("""
+        () => Array.from(document.querySelectorAll('tr.tpgrid'))
+                  .map((row, idx) => {
+                      const vc = row.querySelector('td.tpcol-vouchernumber');
+                      return vc ? { index: idx, voucher: (vc.textContent || '').replace(/,/g, '').trim() } : null;
+                  })
+                  .filter(Boolean)
+    """) or []
+
+    result_vouchers = [r["voucher"] for r in rows_data]
+    result_set = set(result_vouchers)
+
+    if result_set and result_set == target:
+        # Todos los resultados coinciden con el Excel → SELECT ALL (1 click, sin llamadas por fila)
+        sv.locator("button.tpselectall").click()
+        loaded = list(result_vouchers)
+        log.info("    SELECT ALL: %d vouchers (resultados == Excel)", len(loaded))
+    else:
+        # Hay extras en TourplanNX → click individual por cada voucher del Excel.
+        # El grid se re-renderiza tras cada round-trip (~2s/fila), por eso se busca el índice
+        # fresco en el DOM antes de cada click (no usar índice estático de rows_data).
+        try:
+            page.locator("tr.tpgrid td.tpcol-checkbox").first.wait_for(state="visible", timeout=8000)
+        except Exception:
+            pass
+        loaded = []
+        for target_voucher in sorted(target):
+            row_idx: int = page.evaluate("""
+                (vnum) => {
+                    const rows = Array.from(document.querySelectorAll('tr.tpgrid'));
+                    for (let i = 0; i < rows.length; i++) {
+                        const vc = rows[i].querySelector('td.tpcol-vouchernumber');
+                        if (vc && vc.textContent.replace(/,/g, '').trim() === vnum) return i;
+                    }
+                    return -1;
+                }
+            """, str(target_voucher))
+            if row_idx >= 0:
+                page.locator("tr.tpgrid").nth(row_idx).locator("td.tpcol-checkbox").click(timeout=10000)
+                _wait_for_spinner(page)
+                loaded.append(target_voucher)
+        log.info("    Clicks individuales: %d/%d seleccionados", len(loaded), len(result_vouchers))
+
+    not_found = sorted(target - set(loaded))
+    log.info("    Seleccionados %d/%d vouchers (%d no encontrados)",
+             len(loaded), len(target), len(not_found))
+
+    if not loaded:
+        log.warning("    Ningún voucher encontrado en lupa — saliendo sin cargar")
+        try:
+            sv.get_by_role("button", name="EXIT").click(force=True)
+            sv.wait_for(state="hidden", timeout=MODAL_TIMEOUT)
+        except Exception:
+            pass
+        return {"loaded": [], "not_found": sorted(target)}
+
+    # 7. OK → carga todas las líneas seleccionadas y cierra el modal
+    sv.get_by_role("button", name="OK").click()
+    log.info("    OK -> cargando %d lineas...", len(loaded))
+    sv.wait_for(state="hidden", timeout=30000)
+    _wait_for_spinner(page)
+    page.wait_for_timeout(800)
+
+    log.info("    Lupa completada: %d cargados, %d no encontrados", len(loaded), len(not_found))
+    return {"loaded": loaded, "not_found": not_found}
 
 
 def abort_transaction(page: Page) -> None:

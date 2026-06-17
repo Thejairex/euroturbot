@@ -358,6 +358,11 @@ function updateStats(statsData, state, heartbeatAge) {
   updateActivity(statsData.activity);
   updateSkipped(statsData.skipped_vouchers);
 
+  // Actualizar contadores del archivo en curso en tiempo real
+  if (statsData.activity && statsData.activity.file) {
+    updateFileCountsLive(statsData.activity.file, statsData.ok, statsData.failed);
+  }
+
   stepsBody.innerHTML = '';
   if (statsData.steps && statsData.steps.length > 0) {
     statsData.steps.forEach((s, i) => {
@@ -389,16 +394,17 @@ function updateTracker(data) {
   if (data.files && data.files.length > 0) {
     data.files.forEach(f => {
       const tr = document.createElement('tr');
+      tr.dataset.filename = f.filename;  // para actualizaciones en vivo
       let icon = '⏳';
       if (f.status === 'completed') icon = '✅';
       else if (f.status === 'failed') icon = '❌';
       else if (f.status === 'processing') icon = '🔄';
       tr.innerHTML = `
         <td title="${escapeHtml(f.filename)}">${escapeHtml(f.filename)}</td>
-        <td class="status-${f.status}">${icon} ${f.status}</td>
-        <td>${f.total_rows}</td>
-        <td class="status-ok">${f.ok_rows || 0}</td>
-        <td class="status-failed">${f.failed_rows || 0}</td>
+        <td class="status-${f.status}" data-cell="status">${icon} ${f.status}</td>
+        <td>${f.total_rows.toLocaleString()}</td>
+        <td class="status-ok" data-cell="ok">${(f.ok_rows || 0).toLocaleString()}</td>
+        <td class="status-failed" data-cell="failed">${(f.failed_rows || 0).toLocaleString()}</td>
         <td class="error-cell">${escapeHtml(f.error || '-')}</td>
         <td><button class="btn btn-tiny btn-danger" onclick="resetFile('${escapeHtml(f.filename)}')">✕</button></td>
       `;
@@ -406,6 +412,21 @@ function updateTracker(data) {
     });
   } else {
     filesBody.innerHTML = '<tr><td colspan="7" class="empty">Sin archivos procesados aún</td></tr>';
+  }
+}
+
+function updateFileCountsLive(filename, ok, failed) {
+  if (!filename) return;
+  const row = filesBody.querySelector(`tr[data-filename="${CSS.escape(filename)}"]`);
+  if (!row) return;
+  const okCell = row.querySelector('[data-cell="ok"]');
+  const failedCell = row.querySelector('[data-cell="failed"]');
+  const statusCell = row.querySelector('[data-cell="status"]');
+  if (okCell) okCell.textContent = (ok || 0).toLocaleString();
+  if (failedCell) failedCell.textContent = (failed || 0).toLocaleString();
+  if (statusCell && statusCell.textContent.indexOf('processing') === -1) {
+    statusCell.className = 'status-processing';
+    statusCell.textContent = '🔄 processing';
   }
 }
 

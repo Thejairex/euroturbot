@@ -8,7 +8,16 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from config.settings import LOG_DIR, BASE_DIR
+from config.settings import (
+    LOG_DIR,
+    BASE_DIR,
+    DB_CONNECTION,
+    DB_HOST,
+    DB_PORT,
+    DB_DATABASE,
+    DB_USERNAME,
+    DB_PASSWORD,
+)
 from core.pipeline import INPUT_DIR
 from data.tracker import ProcessTracker
 from main import run_manager
@@ -17,6 +26,31 @@ app = FastAPI(title="Monitor de Automatización")
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+def _get_tracker_conn():
+    """Devuelve (connection, db_type). El caller debe cerrar la conexión."""
+    if DB_CONNECTION == "pgsql":
+        import psycopg2
+        import psycopg2.extras
+
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=int(DB_PORT),
+            dbname=DB_DATABASE,
+            user=DB_USERNAME,
+            password=DB_PASSWORD,
+            cursor_factory=psycopg2.extras.RealDictCursor,
+        )
+        return conn, "pgsql"
+    import sqlite3
+
+    db_path = BASE_DIR / "outputs" / "tracker.db"
+    if not db_path.exists():
+        return None, "sqlite"
+    conn = sqlite3.connect(f"file:{db_path}?immutable=1", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn, "sqlite"
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -151,16 +185,12 @@ async def get_sheets():
 
 @app.get("/api/history")
 async def get_history():
-    """Devuelve todos los vouchers procesados de sesiones anteriores (desde tracker.db).
-    Si ORDER BY falla (DB corrupta), lee en chunks sin ordenar."""
+    """Devuelve todos los vouchers procesados. PostgreSQL: query directa.
+    SQLite: query directa con fallback por chunks si la DB está corrupta."""
     def _fetch():
-        import sqlite3
-        db_path = BASE_DIR / "outputs" / "tracker.db"
-        if not db_path.exists():
+        conn, db_type = _get_tracker_conn()
+        if conn is None:
             return {"vouchers": [], "total": 0}
-
-        conn = sqlite3.connect(f"file:{db_path}?immutable=1", uri=True)
-        conn.row_factory = sqlite3.Row
 
         def _row_to_dict(r):
             ts_raw = r["processed_at"] or ""
@@ -177,126 +207,166 @@ async def get_history():
                 "source": "history",
             }
 
-        # Intento 1: query directa con ORDER BY (DB sana)
-        try:
-            rows = conn.execute(
-                "SELECT filename, row_index, booking_reference, supplier_code, currency, "
-                "status, error, processed_at "
-                "FROM processed_rows "
-                "WHERE status IN ('ok', 'failed', 'skipped') "
-                "ORDER BY processed_at DESC"
-            ).fetchall()
-            conn.close()
-            return {"vouchers": [_row_to_dict(r) for r in rows], "total": len(rows)}
-        except Exception:
-            pass
+        BASE_SQL = (
+            "SELECT filename, row_index, booking_reference, supplier_code, currency, "
+            "status, error, processed_at "
+            "FROM processed_rows "
+            "WHERE status IN ('ok', 'failed', 'skipped') "
+            "ORDER BY processed_at DESC"
+        )
 
-        # Intento 2: scan por chunks sin ORDER BY (DB parcialmente corrupta)
-        result = []
-        CHUNK = 5000
-        offset = 0
-        while True:
+        try:
+            if db_type == "pgsql":
+                cur = conn.cursor()
+                cur.execute(BASE_SQL)
+                rows = cur.fetchall()
+                conn.close()
+                return {"vouchers": [_row_to_dict(r) for r in rows], "total": len(rows)}
+
+            # SQLite: query directa primero
             try:
-                chunk = conn.execute(
-                    "SELECT filename, row_index, booking_reference, supplier_code, currency, "
-                    "status, error, processed_at "
-                    "FROM processed_rows "
-                    "WHERE status IN ('ok', 'failed', 'skipped') "
-                    "LIMIT ? OFFSET ?",
-                    (CHUNK, offset),
-                ).fetchall()
+                rows = conn.execute(BASE_SQL).fetchall()
+                conn.close()
+                return {"vouchers": [_row_to_dict(r) for r in rows], "total": len(rows)}
             except Exception:
-                break
-            if not chunk:
-                break
-            result.extend(_row_to_dict(r) for r in chunk)
-            offset += CHUNK
+                pass
 
-        conn.close()
-        return {"vouchers": result, "total": len(result)}
-
-    return await run_in_threadpool(_fetch)
-
-
-@app.get("/api/report")
-async def get_report():
-    """Resumen agregado por proveedor desde tracker.db.
-    Si el GROUP BY falla (DB corrupta), lee en chunks y agrega en Python."""
-    def _fetch():
-        import sqlite3
-        db_path = BASE_DIR / "outputs" / "tracker.db"
-        if not db_path.exists():
-            return {"suppliers": [], "totals": {}}
-
-        conn = sqlite3.connect(f"file:{db_path}?immutable=1", uri=True)
-        conn.row_factory = sqlite3.Row
-
-        # Intento 1: GROUP BY en SQL (DB sana)
-        try:
-            rows = conn.execute("""
-                SELECT
-                    supplier_code,
-                    COUNT(*) AS total,
-                    SUM(CASE WHEN status='ok'      THEN 1 ELSE 0 END) AS ok,
-                    SUM(CASE WHEN status='failed'  THEN 1 ELSE 0 END) AS failed,
-                    SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END) AS skipped,
-                    SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
-                    GROUP_CONCAT(DISTINCT currency) AS currencies,
-                    MAX(processed_at) AS last_processed
-                FROM processed_rows
-                WHERE supplier_code IS NOT NULL AND supplier_code != ''
-                GROUP BY supplier_code
-                ORDER BY total DESC
-            """).fetchall()
-            conn.close()
-            suppliers = [dict(r) for r in rows]
-        except Exception:
-            # Intento 2: scan por chunks, agrega en Python (DB parcialmente corrupta)
-            agg: dict = {}
+            # SQLite fallback: chunks para DB parcialmente corrupta
+            result = []
             CHUNK = 5000
             offset = 0
             while True:
                 try:
                     chunk = conn.execute(
-                        "SELECT supplier_code, currency, status, processed_at "
-                        "FROM processed_rows LIMIT ? OFFSET ?",
+                        "SELECT filename, row_index, booking_reference, supplier_code, currency, "
+                        "status, error, processed_at "
+                        "FROM processed_rows "
+                        "WHERE status IN ('ok', 'failed', 'skipped') "
+                        "LIMIT ? OFFSET ?",
                         (CHUNK, offset),
                     ).fetchall()
                 except Exception:
                     break
                 if not chunk:
                     break
-                for r in chunk:
-                    sup = r["supplier_code"] or ""
-                    if not sup:
-                        continue
-                    if sup not in agg:
-                        agg[sup] = {"supplier_code": sup, "total": 0, "ok": 0,
-                                    "failed": 0, "skipped": 0, "pending": 0,
-                                    "currencies": set(), "last_processed": ""}
-                    e = agg[sup]
-                    e["total"] += 1
-                    st = r["status"] or "pending"
-                    if st in e:
-                        e[st] += 1
-                    if r["currency"]:
-                        e["currencies"].add(r["currency"])
-                    ts = r["processed_at"] or ""
-                    if ts > e["last_processed"]:
-                        e["last_processed"] = ts
+                result.extend(_row_to_dict(r) for r in chunk)
                 offset += CHUNK
             conn.close()
-            suppliers = sorted(
-                [
-                    {**s, "currencies": ",".join(sorted(s["currencies"]))}
-                    for s in agg.values()
-                ],
-                key=lambda x: x["total"],
-                reverse=True,
-            )
+            return {"vouchers": result, "total": len(result)}
 
-        totals: dict = {"total": 0, "ok": 0, "failed": 0, "skipped": 0,
-                        "pending": 0, "suppliers": len(suppliers)}
+        except Exception as e:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return {"vouchers": [], "total": 0, "error": str(e)}
+
+    return await run_in_threadpool(_fetch)
+
+
+@app.get("/api/report")
+async def get_report():
+    """Resumen agregado por proveedor. PostgreSQL: GROUP BY directo con STRING_AGG.
+    SQLite: GROUP BY con fallback por chunks si la DB está corrupta."""
+    def _fetch():
+        conn, db_type = _get_tracker_conn()
+        if conn is None:
+            return {"suppliers": [], "totals": {}}
+
+        try:
+            if db_type == "pgsql":
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT
+                        supplier_code,
+                        COUNT(*) AS total,
+                        SUM(CASE WHEN status='ok'      THEN 1 ELSE 0 END) AS ok,
+                        SUM(CASE WHEN status='failed'  THEN 1 ELSE 0 END) AS failed,
+                        SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END) AS skipped,
+                        SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
+                        STRING_AGG(DISTINCT currency, ',') AS currencies,
+                        MAX(processed_at) AS last_processed
+                    FROM processed_rows
+                    WHERE supplier_code IS NOT NULL AND supplier_code != ''
+                    GROUP BY supplier_code
+                    ORDER BY total DESC
+                """)
+                suppliers = [dict(r) for r in cur.fetchall()]
+                conn.close()
+            else:
+                # SQLite: GROUP BY directo primero
+                try:
+                    rows = conn.execute("""
+                        SELECT
+                            supplier_code,
+                            COUNT(*) AS total,
+                            SUM(CASE WHEN status='ok'      THEN 1 ELSE 0 END) AS ok,
+                            SUM(CASE WHEN status='failed'  THEN 1 ELSE 0 END) AS failed,
+                            SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END) AS skipped,
+                            SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
+                            GROUP_CONCAT(DISTINCT currency) AS currencies,
+                            MAX(processed_at) AS last_processed
+                        FROM processed_rows
+                        WHERE supplier_code IS NOT NULL AND supplier_code != ''
+                        GROUP BY supplier_code
+                        ORDER BY total DESC
+                    """).fetchall()
+                    conn.close()
+                    suppliers = [dict(r) for r in rows]
+                except Exception:
+                    # SQLite fallback: scan por chunks, agrega en Python
+                    agg: dict = {}
+                    CHUNK = 5000
+                    offset = 0
+                    while True:
+                        try:
+                            chunk = conn.execute(
+                                "SELECT supplier_code, currency, status, processed_at "
+                                "FROM processed_rows LIMIT ? OFFSET ?",
+                                (CHUNK, offset),
+                            ).fetchall()
+                        except Exception:
+                            break
+                        if not chunk:
+                            break
+                        for r in chunk:
+                            sup = r["supplier_code"] or ""
+                            if not sup:
+                                continue
+                            if sup not in agg:
+                                agg[sup] = {
+                                    "supplier_code": sup, "total": 0, "ok": 0,
+                                    "failed": 0, "skipped": 0, "pending": 0,
+                                    "currencies": set(), "last_processed": "",
+                                }
+                            e = agg[sup]
+                            e["total"] += 1
+                            st = r["status"] or "pending"
+                            if st in e:
+                                e[st] += 1
+                            if r["currency"]:
+                                e["currencies"].add(r["currency"])
+                            ts = r["processed_at"] or ""
+                            if ts > e["last_processed"]:
+                                e["last_processed"] = ts
+                        offset += CHUNK
+                    conn.close()
+                    suppliers = sorted(
+                        [{**s, "currencies": ",".join(sorted(s["currencies"]))} for s in agg.values()],
+                        key=lambda x: x["total"],
+                        reverse=True,
+                    )
+        except Exception as e:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return {"suppliers": [], "totals": {}, "error": str(e)}
+
+        totals: dict = {
+            "total": 0, "ok": 0, "failed": 0, "skipped": 0,
+            "pending": 0, "suppliers": len(suppliers),
+        }
         for s in suppliers:
             for k in ("total", "ok", "failed", "skipped", "pending"):
                 totals[k] += s.get(k, 0)

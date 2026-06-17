@@ -366,6 +366,7 @@ def parse_args():
     parser.add_argument("--fresh-login", action="store_true", help="Ignorar sesión guardada y hacer login desde cero")
     parser.add_argument("--clear-session", action="store_true", help="Borrar la sesión guardada en disco y salir")
     parser.add_argument("--supplier", type=str, help="Procesar solo el proveedor con este Supplier_Code (para testing masivo)")
+    parser.add_argument("--suppliers", type=str, help="Procesar solo estos proveedores (Supplier_Code separados por coma)")
     parser.add_argument("--limit", type=int, default=None, help="Procesar como máximo N proveedores pendientes por corrida (modo lote)")
     parser.add_argument("--max-vouchers", type=int, default=None, help="Saltar proveedores con más de N vouchers (default: settings; <=0 sin límite)")
     return parser.parse_args()
@@ -417,6 +418,8 @@ def main():
             test_config["row"] = args.row
         if args.supplier is not None:
             test_config["supplier"] = args.supplier
+        if args.suppliers is not None:
+            test_config["suppliers"] = [s.strip() for s in args.suppliers.split(",") if s.strip()]
 
     use_session = not args.fresh_login
     if args.fresh_login:

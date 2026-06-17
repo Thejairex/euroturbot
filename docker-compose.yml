@@ -20,3 +20,10 @@ services:
     shm_size: "256mb"
 
     restart: unless-stopped
+
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true
