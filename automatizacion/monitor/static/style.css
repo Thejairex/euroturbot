@@ -263,6 +263,20 @@ main { max-width: 1200px; margin: 0 auto; padding: 2rem; }
 
 .voucher-ts { color: #64748b; font-size: 0.78rem; font-family: 'JetBrains Mono', 'Consolas', monospace; white-space: nowrap; }
 .voucher-number { font-family: 'JetBrains Mono', 'Consolas', monospace; font-size: 0.85rem; }
+.voucher-date { color: #475569; font-size: 0.72rem; }
+
+.row-history td { opacity: 0.65; }
+.row-history:hover td { opacity: 0.9; transition: opacity 0.15s; }
+
+.history-divider td {
+  text-align: center;
+  color: #334155;
+  font-size: 0.78rem;
+  padding: 0.4rem;
+  background: #0f172a;
+  border-top: 1px solid #1e293b;
+  letter-spacing: 0.08em;
+}
 
 .skipped-section { margin-bottom: 2rem; }
 .skipped-section h2 { margin-bottom: 0.75rem; font-size: 1.1rem; color: #f59e0b; }

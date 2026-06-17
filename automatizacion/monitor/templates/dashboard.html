@@ -381,7 +381,7 @@ const seenSeqs = new Set();
 const vouchersBody = $('vouchersBody');
 const voucherCount = $('voucherCount');
 const MAX_VOUCHER_ROWS = 500;
-const seenVoucherSeqs = new Set();
+const seenVoucherKeys = new Set();  // "l:<seq>" para live, "h:<id>" para historial
 let totalVouchers = 0;
 
 const filterState = { ok: true, failed: true, skipped: true };
@@ -398,7 +398,7 @@ const filterState = { ok: true, failed: true, skipped: true };
 
 $('btnClearVouchers').addEventListener('click', function() {
   vouchersBody.innerHTML = '<tr><td colspan="6" class="empty">Sin vouchers procesados aún</td></tr>';
-  seenVoucherSeqs.clear();
+  seenVoucherKeys.clear();
   totalVouchers = 0;
   updateVoucherCount();
 });
@@ -413,6 +413,32 @@ function applyVoucherFilter() {
   });
 }
 
+function _buildVoucherRow(v, isHistory) {
+  const tr = document.createElement('tr');
+  tr.dataset.status = v.status;
+  if (isHistory) tr.classList.add('row-history');
+  if (!filterState[v.status]) tr.style.display = 'none';
+
+  const icon = v.status === 'failed' ? '❌' : v.status === 'skipped' ? '⏭️' : '✅';
+  const tsCell = isHistory
+    ? `<span class="voucher-date">${escapeHtml(v.date || '')}</span> ${escapeHtml(v.ts || '')}`
+    : escapeHtml(v.ts || '');
+  const supplierCell = isHistory
+    ? `<span title="${escapeHtml(v.filename || '')}">${escapeHtml(v.supplier_code || '-')}</span>`
+    : escapeHtml(v.supplier_code || '-');
+
+  tr.innerHTML = `
+    <td class="voucher-ts">${tsCell}</td>
+    <td>${supplierCell}</td>
+    <td class="voucher-number">${escapeHtml(v.voucher || '-')}</td>
+    <td>${escapeHtml(v.currency || '-')}</td>
+    <td class="status-${v.status}">${icon} ${v.status}</td>
+    <td class="error-cell">${escapeHtml(v.error || '-')}</td>
+  `;
+  return tr;
+}
+
+// Vouchers de la sesión actual — se insertan al principio (newest first)
 function prependVouchers(vouchers) {
   if (!vouchers || vouchers.length === 0) return;
 
@@ -420,34 +446,46 @@ function prependVouchers(vouchers) {
   if (placeholder) placeholder.parentElement.removeChild(placeholder);
 
   vouchers.forEach(v => {
-    if (seenVoucherSeqs.has(v.seq)) return;
-    seenVoucherSeqs.add(v.seq);
+    const key = 'l:' + v.seq;
+    if (seenVoucherKeys.has(key)) return;
+    seenVoucherKeys.add(key);
     totalVouchers++;
 
-    const tr = document.createElement('tr');
-    tr.dataset.status = v.status;
-    if (!filterState[v.status]) tr.style.display = 'none';
-
-    let icon = '✅';
-    if (v.status === 'failed') icon = '❌';
-    else if (v.status === 'skipped') icon = '⏭️';
-
-    tr.innerHTML = `
-      <td class="voucher-ts">${escapeHtml(v.ts || '')}</td>
-      <td>${escapeHtml(v.supplier_code || '-')}</td>
-      <td class="voucher-number">${escapeHtml(v.voucher || '-')}</td>
-      <td>${escapeHtml(v.currency || '-')}</td>
-      <td class="status-${v.status}">${icon} ${v.status}</td>
-      <td class="error-cell">${escapeHtml(v.error || '-')}</td>
-    `;
-    // Insertar al principio (newest first)
-    vouchersBody.insertBefore(tr, vouchersBody.firstChild);
+    // Insertar antes del primer elemento NO-historial (para que el historial quede abajo)
+    const firstHistory = vouchersBody.querySelector('.row-history');
+    vouchersBody.insertBefore(_buildVoucherRow(v, false), firstHistory || null);
   });
 
-  // Limitar DOM
+  // Limitar DOM — sacar los más viejos del historial primero
   while (vouchersBody.children.length > MAX_VOUCHER_ROWS) {
     vouchersBody.removeChild(vouchersBody.lastChild);
   }
+
+  updateVoucherCount();
+}
+
+// Vouchers de sesiones anteriores — se agregan al final
+function appendHistoryVouchers(vouchers) {
+  if (!vouchers || vouchers.length === 0) return;
+
+  const placeholder = vouchersBody.querySelector('.empty');
+  if (placeholder) placeholder.parentElement.removeChild(placeholder);
+
+  // Separador de sección (solo una vez)
+  if (!vouchersBody.querySelector('.history-divider')) {
+    const sep = document.createElement('tr');
+    sep.className = 'history-divider';
+    sep.innerHTML = '<td colspan="6">— Sesiones anteriores —</td>';
+    vouchersBody.appendChild(sep);
+  }
+
+  vouchers.forEach(v => {
+    const key = 'h:' + v.id;
+    if (seenVoucherKeys.has(key)) return;
+    seenVoucherKeys.add(key);
+    totalVouchers++;
+    vouchersBody.appendChild(_buildVoucherRow(v, true));
+  });
 
   updateVoucherCount();
 }
@@ -634,8 +672,19 @@ $('btnLoadLogs').addEventListener('click', function() {
     .catch(() => {});
 });
 
-// Arrancar SSE y tracker al cargar
+async function loadHistory() {
+  try {
+    const res = await fetch('/api/history?limit=500');
+    const data = await res.json();
+    if (data.vouchers && data.vouchers.length > 0) {
+      appendHistoryVouchers(data.vouchers);
+    }
+  } catch (e) {}
+}
+
+// Arrancar SSE, tracker e historial al cargar
 fetchTracker();
+loadHistory();
 connectSSE();
 </script>
 

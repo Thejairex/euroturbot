@@ -8,7 +8,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from config.settings import LOG_DIR
+from config.settings import LOG_DIR, BASE_DIR
 from core.pipeline import INPUT_DIR
 from data.tracker import ProcessTracker
 from main import run_manager
@@ -145,6 +145,51 @@ async def get_sheets():
                 except Exception:
                     result[f.name] = []
         return result
+
+    return await run_in_threadpool(_fetch)
+
+
+@app.get("/api/history")
+async def get_history(limit: int = 500):
+    """Devuelve los últimos N vouchers procesados de sesiones anteriores (desde tracker.db)."""
+    def _fetch():
+        import sqlite3
+        db_path = BASE_DIR / "outputs" / "tracker.db"
+        if not db_path.exists():
+            return {"vouchers": []}
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT filename, row_index, booking_reference, supplier_code, currency, "
+                "status, error, processed_at "
+                "FROM processed_rows "
+                "WHERE status IN ('ok', 'failed', 'skipped') "
+                "ORDER BY processed_at DESC "
+                "LIMIT ?",
+                (limit,),
+            ).fetchall()
+        finally:
+            conn.close()
+        result = []
+        for r in rows:
+            ts_raw = r["processed_at"] or ""
+            # "YYYY-MM-DD HH:MM:SS" → date="MM-DD", ts="HH:MM:SS"
+            date_part = ts_raw[5:10] if len(ts_raw) >= 10 else ""
+            time_part = ts_raw[11:19] if len(ts_raw) >= 19 else ts_raw
+            result.append({
+                "id": f"{r['filename']}:{r['row_index']}",
+                "date": date_part,
+                "ts": time_part,
+                "supplier_code": r["supplier_code"] or "",
+                "voucher": r["booking_reference"] or "",
+                "currency": r["currency"] or "",
+                "status": r["status"],
+                "error": r["error"] or "",
+                "filename": r["filename"],
+                "source": "history",
+            })
+        return {"vouchers": result}
 
     return await run_in_threadpool(_fetch)
 
