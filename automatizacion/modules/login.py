@@ -17,9 +17,24 @@ def do_login(page: Page, stats: StatsTracker, url: str = "", username: str = "",
         page.goto(url)
         page.wait_for_load_state("networkidle")
 
+        # Cerrar cualquier tp-dialog que pueda interceptar el click del botón Login
+        try:
+            page.evaluate("""
+                () => {
+                    const dlg = document.querySelector('tp-dialog');
+                    if (dlg) {
+                        const btn = dlg.querySelector('button');
+                        if (btn) btn.click();
+                    }
+                }
+            """)
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
+
         page.fill("input.username", username)
         page.fill("input.password", password)
-        page.click("button.tpbutton.login")
+        page.click("button.tpbutton.login", force=True)
 
         page.wait_for_load_state("networkidle", timeout=30000)
         page.wait_for_function(
