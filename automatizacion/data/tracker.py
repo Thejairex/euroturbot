@@ -103,6 +103,31 @@ class ProcessTracker:
             cur = self._conn.cursor()
             for s in stmts:
                 cur.execute(s)
+
+            # Si las tablas ya existían sin PK (ej. creadas manualmente), las agrega.
+            # La lógica condicional queda en PL/pgSQL para evitar fetches en Python.
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.table_constraints
+                        WHERE table_schema = 'public'
+                          AND table_name = 'processed_files'
+                          AND constraint_type = 'PRIMARY KEY'
+                    ) THEN
+                        ALTER TABLE processed_files ADD PRIMARY KEY (filename);
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.table_constraints
+                        WHERE table_schema = 'public'
+                          AND table_name = 'processed_rows'
+                          AND constraint_type = 'PRIMARY KEY'
+                    ) THEN
+                        ALTER TABLE processed_rows ADD PRIMARY KEY (filename, row_index);
+                    END IF;
+                END $$;
+            """)
+
             cur.execute(
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_name = 'processed_rows' AND table_schema = 'public'"
