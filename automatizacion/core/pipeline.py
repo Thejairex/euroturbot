@@ -38,12 +38,22 @@ class PipelineStopped(Exception):
 _MESES = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 _FECHA_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?: \d{2}:\d{2}:\d{2}(?:\.\d+)?)?$")
 
+# Overrides verificados manualmente contra TourplanNX: códigos cuyo valor reconstruido
+# canónico (DMONYY) NO coincide con el código real guardado en el sistema.
+# Confirmados buscándolos en el creditor search (2026-06-18).
+_OVERRIDES_CODIGO = {
+    "1APR01": "1APRI1",   # Valeria Marina Aprile (Guía)
+    "6JUL02": "6JUL2",    # Julie Clugnac (Guía)
+    "6AUG01": "6AUGU1",   # Augusto Ushuaia (Restaurante)
+}
 
-def _reconstruir_voucher_fecha(value):
-    """Si Excel convirtió el voucher a fecha, reconstruye 'DMONYY' (ej: 1JAN09).
+
+def _reconstruir_valor_fecha(value):
+    """Si Excel convirtió un código/voucher a fecha, reconstruye 'DMONYY' (ej: 1MAR02).
 
     Devuelve (valor_final, fue_reconstruido). Solo toca strings con pinta de fecha
-    stringificada por pandas; los vouchers numéricos normales pasan sin cambios.
+    stringificada por pandas; los códigos/vouchers normales pasan sin cambios.
+    Aplica overrides verificados para los códigos cuyo formato real difiere del canónico.
     """
     if not isinstance(value, str):
         return value, False
@@ -51,19 +61,24 @@ def _reconstruir_voucher_fecha(value):
     if not m:
         return value, False
     y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    return f"{d}{_MESES[mo - 1]}{y % 100:02d}", True
+    canonico = f"{d}{_MESES[mo - 1]}{y % 100:02d}"
+    return _OVERRIDES_CODIGO.get(canonico, canonico), True
+
+
+# Columnas donde Excel puede auto-convertir un valor tipo "1MAR02" a fecha.
+_COLUMNAS_FECHA = ("Supplier_Code", "Voucher_Number")
 
 
 def _escribir_reporte_reconstruidos(filepath: Path, reconstruidos: list[tuple]):
-    """Escribe un CSV con los vouchers que se reconstruyeron desde fecha (transparencia)."""
+    """Escribe un CSV con los valores que se reconstruyeron desde fecha (transparencia)."""
     out_dir = BASE_DIR / "outputs" / "reports"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"vouchers_fecha_reconstruidos_{filepath.stem}.csv"
+    out_path = out_dir / f"fecha_reconstruidos_{filepath.stem}.csv"
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["row_index", "valor_leido_excel", "voucher_reconstruido", "supplier_code"])
+        w.writerow(["row_index", "columna", "valor_leido_excel", "valor_reconstruido"])
         w.writerows(reconstruidos)
-    log.info("Reporte de vouchers reconstruidos: %s (%d entradas)", out_path, len(reconstruidos))
+    log.info("Reporte de valores reconstruidos desde fecha: %s (%d entradas)", out_path, len(reconstruidos))
 
 
 def get_data_rows(filepath: Path, sheet_name: str | None = None) -> list[dict]:
@@ -93,15 +108,16 @@ def get_data_rows(filepath: Path, sheet_name: str | None = None) -> list[dict]:
     records = data.to_dict(orient="records")
     reconstruidos = []
     for i, rec in enumerate(records):
-        nuevo, cambio = _reconstruir_voucher_fecha(rec.get("Voucher_Number"))
-        if cambio:
-            reconstruidos.append(
-                (i, rec.get("Voucher_Number"), nuevo, (rec.get("Supplier_Code") or "").strip())
-            )
-            rec["Voucher_Number"] = nuevo
+        for col in _COLUMNAS_FECHA:
+            if col not in rec:
+                continue
+            nuevo, cambio = _reconstruir_valor_fecha(rec.get(col))
+            if cambio:
+                reconstruidos.append((i, col, rec.get(col), nuevo))
+                rec[col] = nuevo
     if reconstruidos:
-        log.warning("get_data_rows: %d voucher(s) reconstruidos desde fecha (ej: %s -> %s)",
-                    len(reconstruidos), reconstruidos[0][1], reconstruidos[0][2])
+        log.warning("get_data_rows: %d valor(es) reconstruidos desde fecha (ej: %s %s -> %s)",
+                    len(reconstruidos), reconstruidos[0][1], reconstruidos[0][2], reconstruidos[0][3])
         _escribir_reporte_reconstruidos(filepath, reconstruidos)
     return records
 
