@@ -335,6 +335,25 @@ class ProcessTracker:
         self._conn.commit()
         return cur.rowcount
 
+    def reset_failed_to_pending(self, filename: str) -> int:
+        """Vuelve a 'pending' las filas 'failed' para reintentarlas (1 vez por ejecución)."""
+        cur = self._execute(
+            "UPDATE processed_rows SET status = 'pending', error = NULL "
+            "WHERE filename = %s AND status = 'failed'",
+            (filename,),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def count_failed_rows(self, filename: str) -> int:
+        """Cuenta las filas en estado 'failed' de un archivo."""
+        row = self._fetchone(
+            "SELECT COUNT(*) AS cnt FROM processed_rows "
+            "WHERE filename = %s AND status = 'failed'",
+            (filename,),
+        )
+        return row["cnt"] if row else 0
+
     def get_row(self, filename: str, row_index: int) -> dict | None:
         row = self._fetchone(
             "SELECT * FROM processed_rows WHERE filename = %s AND row_index = %s",

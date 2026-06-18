@@ -466,6 +466,10 @@ def run_pipeline(
             recovered = tracker.reset_processing_to_pending(filename)
             if recovered:
                 log.info("  Recuperadas %d filas 'processing' → 'pending' (corrida previa interrumpida)", recovered)
+            # Reintentar las filas 'failed' una sola vez por ejecución
+            reintentos = tracker.reset_failed_to_pending(filename)
+            if reintentos:
+                log.info("  Reintentando %d filas 'failed' → 'pending' (1 vez por ejecución)", reintentos)
             pending_rows = tracker.get_pending_rows(filename)
         else:
             pending_rows = [{"row_index": i} for i in range(len(rows))]
@@ -531,15 +535,18 @@ def run_pipeline(
 
             log.info("  Progreso archivo: %d/%d proveedores", i, len(groups))
 
-        # Determinar si mover el archivo o dejarlo en input/
+        # Determinar si mover el archivo o dejarlo en input/.
+        # Las filas 'failed' también retienen el archivo en input/ para reintentarlas
+        # en la próxima ejecución (reset_failed_to_pending al reiniciar).
         remaining = tracker.get_pending_rows(filename) if tracker else []
+        failed_restantes = tracker.count_failed_rows(filename) if tracker else 0
         stopped = pipeline_stopped or bool(stop_event and stop_event.is_set())
 
-        if remaining or stopped:
-            n = len(remaining)
+        if remaining or failed_restantes or stopped:
             if tracker:
                 tracker.mark_file_processing(filename)
-            log.info("Archivo %s incompleto: quedan %d filas pendientes — permanece en input/", filename, n)
+            log.info("Archivo %s incompleto: %d pendientes, %d failed (reintenta próxima corrida) — permanece en input/",
+                     filename, len(remaining), failed_restantes)
         else:
             moved = PROCESSED_DIR / filename
             shutil.move(str(filepath), str(moved))
