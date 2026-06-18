@@ -1,3 +1,5 @@
+import csv
+import re
 import shutil
 from pathlib import Path
 from threading import Event
@@ -33,6 +35,37 @@ class PipelineStopped(Exception):
     pass
 
 
+_MESES = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+_FECHA_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?: \d{2}:\d{2}:\d{2}(?:\.\d+)?)?$")
+
+
+def _reconstruir_voucher_fecha(value):
+    """Si Excel convirtió el voucher a fecha, reconstruye 'DMONYY' (ej: 1JAN09).
+
+    Devuelve (valor_final, fue_reconstruido). Solo toca strings con pinta de fecha
+    stringificada por pandas; los vouchers numéricos normales pasan sin cambios.
+    """
+    if not isinstance(value, str):
+        return value, False
+    m = _FECHA_RE.match(value.strip())
+    if not m:
+        return value, False
+    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return f"{d}{_MESES[mo - 1]}{y % 100:02d}", True
+
+
+def _escribir_reporte_reconstruidos(filepath: Path, reconstruidos: list[tuple]):
+    """Escribe un CSV con los vouchers que se reconstruyeron desde fecha (transparencia)."""
+    out_dir = BASE_DIR / "outputs" / "reports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"vouchers_fecha_reconstruidos_{filepath.stem}.csv"
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["row_index", "valor_leido_excel", "voucher_reconstruido", "supplier_code"])
+        w.writerows(reconstruidos)
+    log.info("Reporte de vouchers reconstruidos: %s (%d entradas)", out_path, len(reconstruidos))
+
+
 def get_data_rows(filepath: Path, sheet_name: str | None = None) -> list[dict]:
     if sheet_name is None:
         sheets = get_sheet_names(filepath)
@@ -56,7 +89,21 @@ def get_data_rows(filepath: Path, sheet_name: str | None = None) -> list[dict]:
     data = data.dropna(axis=1, how="all")
     data = data.loc[:, data.columns.notna()]
     data = data.reset_index(drop=True)
-    return data.to_dict(orient="records")
+
+    records = data.to_dict(orient="records")
+    reconstruidos = []
+    for i, rec in enumerate(records):
+        nuevo, cambio = _reconstruir_voucher_fecha(rec.get("Voucher_Number"))
+        if cambio:
+            reconstruidos.append(
+                (i, rec.get("Voucher_Number"), nuevo, (rec.get("Supplier_Code") or "").strip())
+            )
+            rec["Voucher_Number"] = nuevo
+    if reconstruidos:
+        log.warning("get_data_rows: %d voucher(s) reconstruidos desde fecha (ej: %s -> %s)",
+                    len(reconstruidos), reconstruidos[0][1], reconstruidos[0][2])
+        _escribir_reporte_reconstruidos(filepath, reconstruidos)
+    return records
 
 
 TARGET_SHEET = "TODO SERVICIOS SIN TRANS"
