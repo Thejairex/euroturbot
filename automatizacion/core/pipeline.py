@@ -5,9 +5,11 @@ from threading import Event
 import pandas as pd
 
 from config.settings import BASE_DIR, MAX_VOUCHERS_PER_SUPPLIER
+from config.urls import spa_url
 from core.grouping import group_rows_by_supplier, write_skipped_report, write_oversized_report
 from data.tracker import ProcessTracker
 from modules.creditor_search import open_supplier
+from modules.login import ensure_logged_in
 from modules.supplier_nav import navigate_to_transactions, exit_supplier
 from modules.transaction_creator import (
     create_transaction,
@@ -305,6 +307,13 @@ def process_supplier_group(
             pass
         try:
             exit_supplier(page)
+        except Exception:
+            pass
+        # Hard recovery: forzar navegación a creditor y verificar sesión
+        try:
+            page.goto(spa_url("creditor"))
+            page.wait_for_load_state("networkidle", timeout=15000)
+            ensure_logged_in(page, stats)
         except Exception:
             pass
 
