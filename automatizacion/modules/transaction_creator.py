@@ -125,8 +125,12 @@ def confirm_bulk_transaction(page: Page) -> None:
     Espera a que aparezca el modal Insert Invoice (con botón INSERT).
     Luego abre la primera Invoice Line haciendo click en INSERT.
     """
-    dialog = page.get_by_role("dialog")
+    # Filtrar por el modal Create Transaction (igual que create_bulk_transaction): sin
+    # filtro, get_by_role("dialog") puede agarrar un dialog residual y matchear un OK
+    # equivocado (ej. el botón tpinvoicelines disabled del Insert Invoice).
+    dialog = page.get_by_role("dialog").filter(has_text="Create Transaction").last
     ok_btn = dialog.get_by_role("button", name="OK")
+    expect(ok_btn).to_be_enabled(timeout=MODAL_TIMEOUT)
     ok_btn.click()
     page.locator(VOUCHER_INPUT).wait_for(state="visible", timeout=MODAL_TIMEOUT)
     log.info("  Create Transaction confirmado — Insert Invoice + Invoice Line abiertos")
