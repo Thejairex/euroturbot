@@ -27,4 +27,6 @@ def navigate_to_transactions(page: Page) -> None:
 def exit_supplier(page: Page) -> None:
     log.info("  Saliendo del proveedor...")
     page.get_by_role("button", name="EXIT").first.click()
-    expect(page.locator("#searchSupplier input[type='text']")).to_be_visible(timeout=NAV_TIMEOUT)
+    # Validar editable (no solo visible): el input readonly también es visible, así que
+    # to_be_visible daría falso éxito aunque el proveedor siga abierto.
+    expect(page.locator("#searchSupplier input[type='text']").first).to_be_editable(timeout=NAV_TIMEOUT)

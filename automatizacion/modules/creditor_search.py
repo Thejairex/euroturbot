@@ -12,16 +12,19 @@ def open_supplier(page: Page, supplier_code: str) -> None:
     log.info("  Buscando proveedor: %s", code)
 
     input_el = page.locator("#searchSupplier input[type='text']").first
-    # Si el input no es editable (proveedor anterior no salió limpio), navegar a creditor
+    # Si el input no es editable (proveedor anterior no cerró), recuperar con reload
+    # completo: un goto por hash NO reinicia Angular si ya está en #/creditor con un
+    # proveedor abierto. page.reload() fuerza re-init y vuelve al search limpio.
     try:
         if not input_el.is_editable(timeout=2000):
-            log.warning("  Input de búsqueda no editable — navegando a creditor para limpiar estado")
+            log.warning("  Input de búsqueda no editable — recargando página para limpiar estado")
             page.goto(spa_url("creditor"))
-            page.wait_for_load_state("networkidle", timeout=15000)
+            page.reload(wait_until="networkidle")
+            page.wait_for_timeout(1500)
     except Exception:
         pass
 
-    expect(input_el).to_be_visible(timeout=SEARCH_TIMEOUT)
+    expect(input_el).to_be_editable(timeout=SEARCH_TIMEOUT)
     input_el.fill(code)
 
     page.wait_for_selector(".dropdown table", timeout=SEARCH_TIMEOUT)

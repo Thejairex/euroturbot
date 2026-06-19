@@ -372,9 +372,11 @@ def process_supplier_group(
             exit_supplier(page)
         except Exception:
             pass
-        # Hard recovery: forzar navegación a creditor y verificar sesión
+        # Hard recovery: reload completo para limpiar estado de Angular (un goto por
+        # hash no reinicia la SPA), luego verificar sesión.
         try:
             page.goto(spa_url("creditor"))
+            page.reload(wait_until="networkidle")
             page.wait_for_load_state("networkidle", timeout=15000)
             ensure_logged_in(page, stats)
         except Exception:
