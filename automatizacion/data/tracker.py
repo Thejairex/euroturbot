@@ -345,6 +345,16 @@ class ProcessTracker:
         self._conn.commit()
         return cur.rowcount
 
+    def reset_skipped_to_pending(self, filename: str) -> int:
+        """Vuelve a 'pending' las filas 'skipped' para reintentarlas (1 vez por ejecución)."""
+        cur = self._execute(
+            "UPDATE processed_rows SET status = 'pending', error = NULL "
+            "WHERE filename = %s AND status = 'skipped'",
+            (filename,),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
     def count_failed_rows(self, filename: str) -> int:
         """Cuenta las filas en estado 'failed' de un archivo."""
         row = self._fetchone(

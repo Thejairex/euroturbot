@@ -632,10 +632,13 @@ def run_pipeline(
             recovered = tracker.reset_processing_to_pending(filename)
             if recovered:
                 log.info("  Recuperadas %d filas 'processing' → 'pending' (corrida previa interrumpida)", recovered)
-            # Reintentar las filas 'failed' una sola vez por ejecución
+            # Reintentar las filas 'failed' y 'skipped' una sola vez por ejecución
             reintentos = tracker.reset_failed_to_pending(filename)
             if reintentos:
                 log.info("  Reintentando %d filas 'failed' → 'pending' (1 vez por ejecución)", reintentos)
+            skipped_retry = tracker.reset_skipped_to_pending(filename)
+            if skipped_retry:
+                log.info("  Reintentando %d filas 'skipped' → 'pending' (1 vez por ejecución)", skipped_retry)
             pending_rows = tracker.get_pending_rows(filename)
         else:
             pending_rows = [{"row_index": i} for i in range(len(rows))]
