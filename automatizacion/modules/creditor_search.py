@@ -1,10 +1,11 @@
 from playwright.sync_api import Page, expect
 
 from config.urls import spa_url
+from core.exceptions import SupplierNotFoundError
 from utils.logger import log
 
 
-SEARCH_TIMEOUT = 15000
+SEARCH_TIMEOUT = 30000
 
 
 def open_supplier(page: Page, supplier_code: str) -> None:
@@ -25,11 +26,22 @@ def open_supplier(page: Page, supplier_code: str) -> None:
         pass
 
     expect(input_el).to_be_editable(timeout=SEARCH_TIMEOUT)
+    input_el.click()        # foco explícito para que Angular registre el campo
     input_el.fill(code)
+    page.wait_for_timeout(200)  # debounce Angular antes de esperar el dropdown
 
-    page.wait_for_selector(".dropdown table", timeout=SEARCH_TIMEOUT)
-    row = page.locator(f".dropdown table tr").filter(has_text=code).first
-    expect(row).to_be_visible(timeout=SEARCH_TIMEOUT)
+    # Primer intento rápido; si Angular no disparó el evento de búsqueda, re-trigger
+    # con la tecla End (activa keyup sin modificar el texto) y espera larga.
+    try:
+        page.wait_for_selector(".dropdown table", timeout=5000)
+    except Exception:
+        log.warning("  Dropdown no apareció — re-trigger Angular (End)...")
+        input_el.press("End")
+        page.wait_for_selector(".dropdown table", timeout=SEARCH_TIMEOUT)
+
+    row = page.locator(".dropdown table tr").filter(has_text=code).first
+    if not row.is_visible(timeout=3000):
+        raise SupplierNotFoundError(f"Proveedor '{code}' no encontrado en TourplanNX")
     row.click()
 
     page.wait_for_load_state("networkidle")

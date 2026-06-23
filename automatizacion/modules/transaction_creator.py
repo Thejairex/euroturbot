@@ -2,7 +2,7 @@ from playwright.sync_api import Page, expect
 
 from utils.logger import log
 
-MODAL_TIMEOUT = 10000
+MODAL_TIMEOUT = 30000
 # Espera máxima para que el modal Insert Invoice cierre tras SAVE (el spinner queda
 # colgado, así que la señal real es el cierre del modal). CreateAPInvoice con muchas
 # líneas tarda; con chunks de ~200 debería cerrar en pocos segundos.

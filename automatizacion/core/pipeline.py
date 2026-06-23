@@ -13,6 +13,7 @@ from config.settings import (
     VOUCHER_MAX_RANGE_WIDTH,
 )
 from config.urls import spa_url
+from core.exceptions import SupplierNotFoundError
 from core.grouping import group_rows_by_supplier, write_skipped_report, write_oversized_report
 from data.tracker import ProcessTracker
 from modules.creditor_search import open_supplier
@@ -287,6 +288,15 @@ def process_row(page, row: dict, row_index: int, filename: str, tracker: Process
             "status": "ok", "error": None, "row_index": row_index,
         })
         log.info("  Fila %d OK: %s", row_index, voucher)
+    except SupplierNotFoundError as e:
+        if tracker:
+            tracker.mark_row_skipped(filename, row_index)
+        stats.add_voucher_result({
+            "filename": filename, "supplier_code": supplier_code,
+            "voucher": str(voucher), "currency": row.get("Service_Cost_Currency", ""),
+            "status": "skipped", "error": str(e), "row_index": row_index,
+        })
+        log.warning("  Fila %d SKIPPED (proveedor no encontrado): %s — %s", row_index, voucher, e)
     except Exception as e:
         if tracker:
             tracker.mark_row_failed(filename, row_index, str(e))
@@ -497,6 +507,18 @@ def process_supplier_group(
 
     except PipelineStopped:
         raise
+    except SupplierNotFoundError as e:
+        # El código de proveedor no existe en TourplanNX: marcar todas sus filas como
+        # skipped (no tiene sentido reintentar en corridas futuras).
+        log.warning("  Proveedor %s no encontrado en TourplanNX — %d filas skipped", supplier_code, len(all_indices))
+        if tracker:
+            tracker.mark_rows_skipped_bulk(filename, all_indices)
+        if skipped_report is not None:
+            skipped_report.append({
+                "supplier_code": supplier_code, "reason": str(e),
+                "row_indices": all_indices,
+            })
+        return  # no hace recovery — el sistema está bien, el código simplemente no existe
     except Exception as e:
         log.error("  Proveedor %s FAILED: %s", supplier_code, e)
         group_ok = False

@@ -15,3 +15,6 @@ class CacheError(AutomationError):
 
 class ExcelError(AutomationError):
     """Raised when Excel reading/writing fails."""
+
+class SupplierNotFoundError(AutomationError):
+    """El código de proveedor no existe en TourplanNX (dropdown no devuelve resultados)."""
