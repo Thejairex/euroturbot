@@ -371,6 +371,42 @@ class ProcessTracker:
         )
         return dict(row) if row else None
 
+    def get_rows_by_status(
+        self, status: str, filename: str | None = None
+    ) -> list[dict]:
+        """Devuelve las filas con un estatus dado (ok/failed/skipped/pending/processing).
+
+        Si filename es None, busca en todos los archivos. Read-only: no muta estado.
+        """
+        if filename is None:
+            rows = self._fetchall(
+                "SELECT * FROM processed_rows WHERE status = %s "
+                "ORDER BY filename, row_index",
+                (status,),
+            )
+        else:
+            rows = self._fetchall(
+                "SELECT * FROM processed_rows WHERE filename = %s AND status = %s "
+                "ORDER BY row_index",
+                (filename, status),
+            )
+        return [dict(r) for r in rows]
+
+    def count_rows_by_status(self, status: str, filename: str | None = None) -> int:
+        """Cuenta las filas con un estatus dado (opcionalmente acotado a un archivo)."""
+        if filename is None:
+            row = self._fetchone(
+                "SELECT COUNT(*) AS cnt FROM processed_rows WHERE status = %s",
+                (status,),
+            )
+        else:
+            row = self._fetchone(
+                "SELECT COUNT(*) AS cnt FROM processed_rows "
+                "WHERE filename = %s AND status = %s",
+                (filename, status),
+            )
+        return row["cnt"] if row else 0
+
     # ── Gestión general ───────────────────────────────────────────────────────
 
     def get_summary(self) -> list[dict]:
