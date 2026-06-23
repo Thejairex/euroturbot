@@ -6,7 +6,12 @@ from threading import Event
 
 import pandas as pd
 
-from config.settings import BASE_DIR, MAX_VOUCHERS_PER_SUPPLIER
+from config.settings import (
+    BASE_DIR,
+    MAX_VOUCHERS_PER_SUPPLIER,
+    VOUCHER_CHUNK_SIZE,
+    VOUCHER_MAX_RANGE_WIDTH,
+)
 from config.urls import spa_url
 from core.grouping import group_rows_by_supplier, write_skipped_report, write_oversized_report
 from data.tracker import ProcessTracker
@@ -33,6 +38,125 @@ PROCESSED_DIR = BASE_DIR / "processed"
 class PipelineStopped(Exception):
     """Excepción interna para señal de stop cooperativo dentro de un grupo."""
     pass
+
+
+def _voucher_int(voucher) -> int:
+    """Número de voucher como int para ordenar/calcular rangos (no-dígitos → 0)."""
+    s = str(voucher).replace(",", "").strip()
+    return int(s) if s.isdigit() else 0
+
+
+def _bloque_desde(sub: list[dict]) -> dict:
+    """Arma el dict de un bloque/chunk a partir de sus records."""
+    nums = [_voucher_int(r.get("voucher")) for r in sub if _voucher_int(r.get("voucher"))]
+    return {
+        "records": sub,
+        "vouchers": [r.get("voucher") for r in sub],
+        "total": sum(float(r.get("product_cost") or 0) for r in sub),
+        "vfrom": str(min(nums)) if nums else None,
+        "vto": str(max(nums)) if nums else None,
+    }
+
+
+def chunk_records_for_invoice(
+    records: list[dict], chunk_size: int, max_range_width: int = 0
+) -> list[dict]:
+    """Divide los records de una moneda en bloques (cada uno = una factura), ordenados
+    por número de voucher.
+
+    Un bloque se corta cuando se cumple lo PRIMERO de:
+      - juntar `chunk_size` vouchers, o
+      - que el ancho del rango (voucher_actual - voucher_inicio_del_bloque) supere
+        `max_range_width` (evita el timeout SQL del SEARCH por rango muy ancho).
+
+    Un proveedor chico (<= chunk_size y rango angosto) resulta en 1 solo bloque →
+    comportamiento idéntico al flujo masivo de una sola factura.
+
+    Returns:
+        Lista de dicts {records, vouchers, total, vfrom, vto} por bloque.
+    """
+    if chunk_size <= 0:
+        chunk_size = len(records) or 1
+    ordenados = sorted(records, key=lambda r: _voucher_int(r.get("voucher")))
+    bloques: list[dict] = []
+    actual: list[dict] = []
+    inicio = None
+    for rec in ordenados:
+        n = _voucher_int(rec.get("voucher"))
+        if actual:
+            excede_cant = len(actual) >= chunk_size
+            excede_ancho = max_range_width > 0 and inicio is not None and n - inicio > max_range_width
+            if excede_cant or excede_ancho:
+                bloques.append(_bloque_desde(actual))
+                actual = []
+                inicio = None
+        if not actual:
+            inicio = n if n else None
+        actual.append(rec)
+    if actual:
+        bloques.append(_bloque_desde(actual))
+    return bloques
+
+
+def _cargar_chunk_factura(page, supplier_code, currency, chunk_records, select_all, piso=25):
+    """Carga un chunk de records como UNA factura (INSERT → create_bulk → confirm →
+    lupa SELECT ALL → SAVE).
+
+    Si el SEARCH da timeout (VoucherSearchTimeout), aborta y sub-divide el chunk por
+    rango (mitades) reintentando cada mitad como su propia factura, hasta un piso de
+    `piso` vouchers. Los chunks irrecuperables se devuelven como fallidos.
+
+    Returns:
+        (ok_indices, failed_indices) — row_index de las filas cargadas / fallidas.
+    """
+    indices = [r["row_index"] for r in chunk_records]
+    vouchers = [r["voucher"] for r in chunk_records]
+    nums = [_voucher_int(r["voucher"]) for r in chunk_records if _voucher_int(r["voucher"])]
+    vfrom = str(min(nums)) if nums else None
+    vto = str(max(nums)) if nums else None
+    total = sum(float(r.get("product_cost") or 0) for r in chunk_records)
+    ref = f"INV{chunk_records[0]['row_index']}{supplier_code}"
+
+    try:
+        page.get_by_role("button", name="INSERT").click()
+        create_bulk_transaction(page, total, currency, ref)
+        confirm_bulk_transaction(page)
+        result = add_vouchers_via_search(page, vouchers, vfrom, vto, select_all=select_all)
+        if len(result["loaded"]) == 0:
+            log.warning("    Chunk sin vouchers cargados (%s) — abortando", currency)
+            abort_transaction(page)
+            return ([], indices)
+        totals = read_invoice_totals(page)
+        rem = abs(totals.get("remainder", 9999))
+        if rem >= 0.01:
+            log.warning("    REMAINDER=%.2f en chunk %s — guardando igual", totals.get("remainder", 0), currency)
+        save_invoice(page)
+        log.info("    Factura guardada: %d filas (%s)", len(indices), currency)
+        return (indices, [])
+    except VoucherSearchTimeout:
+        try:
+            abort_transaction(page)
+        except Exception:
+            pass
+        if len(chunk_records) <= piso:
+            log.error("    Chunk mínimo (%d) sigue en timeout — marcando %d filas failed",
+                      len(chunk_records), len(indices))
+            return ([], indices)
+        mid = len(chunk_records) // 2
+        log.warning("    VoucherSearchTimeout en chunk de %d (%s) — sub-dividiendo en %d + %d",
+                    len(chunk_records), currency, mid, len(chunk_records) - mid)
+        ok1, f1 = _cargar_chunk_factura(page, supplier_code, currency, chunk_records[:mid], select_all, piso)
+        ok2, f2 = _cargar_chunk_factura(page, supplier_code, currency, chunk_records[mid:], select_all, piso)
+        return (ok1 + ok2, f1 + f2)
+    except Exception as e:
+        # Cualquier otro fallo del chunk (SAVE colgado, modal inesperado, etc.): abortar
+        # y marcar este chunk failed sin tirar abajo los demás chunks del proveedor.
+        log.error("    Chunk falló (%s): %s — marcando %d filas failed", currency, e, len(indices))
+        try:
+            abort_transaction(page)
+        except Exception:
+            pass
+        return ([], indices)
 
 
 _MESES = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
@@ -198,25 +322,9 @@ def process_supplier_group(
         if tracker:
             tracker.mark_rows_skipped_bulk(filename, skipped_mep)
 
-    # Proveedores grandes: superan el umbral de vouchers → saltar y reportar
-    # (entidades internas tipo 1EURO1/1ING01, inviables de cargar por UI).
-    if max_vouchers and max_vouchers > 0 and group["size"] > max_vouchers:
-        currencies = ", ".join(group["total_by_currency"].keys())
-        totals = "; ".join(f"{c}={t:.2f}" for c, t in group["total_by_currency"].items())
-        log.warning("  Proveedor %s SALTADO: %d vouchers > umbral %d — para revisión manual",
-                    supplier_code, group["size"], max_vouchers)
-        if tracker:
-            tracker.mark_rows_skipped_bulk(filename, [rec["row_index"] for rec in records])
-        if oversized_report is not None:
-            oversized_report.append({
-                "filename": filename,
-                "supplier_code": supplier_code,
-                "supplier_name": group.get("supplier_name", ""),
-                "voucher_count": group["size"],
-                "currencies": currencies,
-                "totals": totals,
-            })
-        return
+    # Proveedores grandes (> umbral): se cargan en modo CHUNKED (varias facturas de
+    # VOUCHER_CHUNK_SIZE c/u, SELECT ALL por chunk). Antes se saltaban; ahora se cargan.
+    es_masivo = bool(max_vouchers and max_vouchers > 0 and group["size"] > max_vouchers)
 
     if group["size"] == 1:
         rec = records[0]
@@ -258,6 +366,35 @@ def process_supplier_group(
                 raise PipelineStopped()
 
             records_for_currency = [rec for rec in records if rec["currency"] == currency]
+
+            # ── Modo CHUNKED (proveedores masivos): varias facturas, SELECT ALL por chunk ──
+            if es_masivo:
+                chunks = chunk_records_for_invoice(
+                    records_for_currency, VOUCHER_CHUNK_SIZE, VOUCHER_MAX_RANGE_WIDTH)
+                log.info("    Moneda %s: total=%.2f, %d vouchers en %d factura(s) (chunked)",
+                         currency, total, len(records_for_currency), len(chunks))
+                stats.set_activity(currency=currency, voucher_total=len(records_for_currency), voucher_idx=0)
+                for ci, chunk in enumerate(chunks, 1):
+                    if stop_event and stop_event.is_set():
+                        raise PipelineStopped()
+                    log.info("    Factura %d/%d: %d vouchers (rango %s-%s)",
+                             ci, len(chunks), len(chunk["records"]), chunk["vfrom"], chunk["vto"])
+                    ok_idx, failed_idx = _cargar_chunk_factura(
+                        page, supplier_code, currency, chunk["records"], select_all=True)
+                    for idx in ok_idx:
+                        per_row_status[idx] = "ok"
+                        stats.add_voucher_result({
+                            "filename": filename, "supplier_code": supplier_code,
+                            "voucher": "", "currency": currency,
+                            "status": "ok", "error": None, "row_index": idx,
+                        })
+                    for idx in failed_idx:
+                        per_row_status[idx] = "failed"
+                        group_ok = False
+                        group_error = group_error or f"Chunk fallido ({currency})"
+                continue
+
+            # ── Modo chico (original, una sola factura, matching contra el Excel) ──
             vouchers_for_currency = [rec["voucher"] for rec in records_for_currency]
             reference = f"INV{records_for_currency[0]['row_index']}{supplier_code}"
             log.info("    Moneda %s: total=%.2f, ref=%s, %d vouchers",
@@ -383,24 +520,29 @@ def process_supplier_group(
             pass
 
     if group_timeout:
+        # Caso chico que dio timeout total en el SEARCH (se trata como oversized).
         if tracker:
             tracker.mark_rows_skipped_bulk(filename, all_indices)
         log.warning("  Proveedor %s marcado oversized por timeout (%d filas skipped)",
                     supplier_code, len(all_indices))
-    elif group_ok:
-        for idx in all_indices:
-            status = per_row_status.get(idx, "ok")
-            if tracker:
-                if status == "skipped":
-                    tracker.mark_row_skipped(filename, idx)
-                else:
-                    tracker.mark_row_ok(filename, idx)
-        log.info("  Proveedor %s masivo completado (%d filas)", supplier_code, len(all_indices))
     else:
+        # Marcar cada fila según su estado real (chunked y chico comparten esta lógica).
+        # Las filas sin estado (no procesadas por un error de navegación) → failed.
+        ok_n = skip_n = fail_n = 0
         for idx in all_indices:
-            if tracker:
-                tracker.mark_row_failed(filename, idx, group_error or "masivo fallido")
-        log.error("  Proveedor %s masivo FAILED: %s", supplier_code, group_error)
+            status = per_row_status.get(idx)
+            if not tracker:
+                continue
+            if status == "ok":
+                tracker.mark_row_ok(filename, idx); ok_n += 1
+            elif status == "skipped":
+                tracker.mark_row_skipped(filename, idx); skip_n += 1
+            else:
+                tracker.mark_row_failed(filename, idx, group_error or "no procesado"); fail_n += 1
+        if fail_n:
+            log.warning("  Proveedor %s: %d ok, %d skipped, %d failed", supplier_code, ok_n, skip_n, fail_n)
+        else:
+            log.info("  Proveedor %s completado: %d ok, %d skipped", supplier_code, ok_n, skip_n)
 
 
 def run_pipeline(

@@ -3,6 +3,10 @@ from playwright.sync_api import Page, expect
 from utils.logger import log
 
 MODAL_TIMEOUT = 10000
+# Espera máxima para que el modal Insert Invoice cierre tras SAVE (el spinner queda
+# colgado, así que la señal real es el cierre del modal). CreateAPInvoice con muchas
+# líneas tarda; con chunks de ~200 debería cerrar en pocos segundos.
+SAVE_TIMEOUT_MS = 120000
 EXPECTED_TOTAL_SELECTOR = "input.tpnumber-invoices"
 VOUCHER_LINE_OK = "button.tpok.tpprimarysystembutton"
 INVOICE_INSERT = "button.tpinsert"
@@ -257,17 +261,20 @@ def save_invoice(page: Page) -> None:
     except Exception:
         pass
 
-    _wait_for_spinner(page)
-    page.wait_for_timeout(1000)
-
-    # Verificar que el modal Insert Invoice se cerró (guardado efectivo). Si sigue
-    # abierto, algún diálogo no se manejó — abortar para no colgar el exit_supplier.
-    dialogs_after = page.get_by_role("dialog").count()
-    if dialogs_after >= dialogs_before:
-        raise RuntimeError(
-            "El modal de invoice sigue abierto tras SAVE — posible diálogo no manejado"
-        )
-    log.info("    Invoice guardado (SAVE)")
+    # Señal de guardado = el modal Insert Invoice se cierra (dialogs disminuyen).
+    # NO se espera el spinner: queda colgado (bug cosmético del UI) aunque el SAVE
+    # haya completado. Polling hasta SAVE_TIMEOUT_MS.
+    waited = 0
+    step = 1000
+    while waited < SAVE_TIMEOUT_MS:
+        if page.get_by_role("dialog").count() < dialogs_before:
+            log.info("    Invoice guardado (SAVE)")
+            return
+        page.wait_for_timeout(step)
+        waited += step
+    raise RuntimeError(
+        "El modal de invoice sigue abierto tras SAVE (timeout) — posible cuelgue de CreateAPInvoice"
+    )
 
 
 def exit_invoice_line(page: Page) -> None:
@@ -307,39 +314,83 @@ def _set_voucher_range(page: Page, voucher_from: str | None, voucher_to: str | N
     log.info("    Rango vouchers: FROM=%s TO=%s", voucher_from, voucher_to)
 
 
+_VOUCHER_ERROR_PATTERNS = [
+    "GetVoucherDetails",
+    "An error has occurred",
+    "Error! 1026",
+    "Execution Timeout",
+    "1026",
+]
+
+
 def _check_voucher_search_error(page: Page) -> None:
-    """Detecta un error de timeout del servidor tras SEARCH y lanza VoucherSearchTimeout."""
+    """Detecta un error/timeout del servidor tras SEARCH y lanza VoucherSearchTimeout.
+
+    El error real del servidor es 'Error! 1026 ... -2 Execution Timeout Expired'
+    (timeout de SQL Server cuando el rango VOUCHER FROM/TO es demasiado ancho).
+    """
     error_text = page.evaluate("""
-        () => {
+        (patterns) => {
             const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
             for (const d of dialogs) {
                 const t = d.textContent || '';
-                if (t.includes('GetVoucherDetails') || t.includes('An error has occurred')) {
-                    return t.substring(0, 120).trim();
+                if (patterns.some(p => t.includes(p))) {
+                    return t.substring(0, 150).trim();
                 }
             }
             return null;
         }
-    """)
+    """, _VOUCHER_ERROR_PATTERNS)
     if not error_text:
         return
     try:
         page.evaluate("""
-            () => {
+            (patterns) => {
                 const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
                 for (const d of dialogs) {
                     const t = d.textContent || '';
-                    if (t.includes('GetVoucherDetails') || t.includes('An error has occurred')) {
+                    if (patterns.some(p => t.includes(p))) {
                         const btn = d.querySelector('button');
                         if (btn) { btn.click(); return true; }
                     }
                 }
                 return false;
             }
-        """)
+        """, _VOUCHER_ERROR_PATTERNS)
     except Exception:
         pass
     raise VoucherSearchTimeout(f"TourplanNX timeout al buscar vouchers: {error_text}")
+
+
+def _read_found_count(page: Page):
+    """Lee el contador 'Found N' del modal Select Vouchers (None si no aparece)."""
+    return page.evaluate("""
+        () => {
+            const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
+            const modal = dialogs[dialogs.length - 1];
+            if (!modal) return null;
+            const m = (modal.textContent || '').replace(/\\s+/g, ' ').match(/Found[\\s:]*([\\d,]+)/i);
+            return m ? parseInt(m[1].replace(/,/g, ''), 10) : null;
+        }
+    """)
+
+
+def _wait_for_search_results(page: Page, timeout_ms: int = 35000) -> int:
+    """Espera el resultado del SEARCH sin depender del spinner (que se cuelga).
+
+    La señal de fin es el contador 'Found' > 0. Chequea el error de timeout SQL
+    en cada iteración. Devuelve el conteo encontrado (0 si no hubo resultados).
+    """
+    waited = 0
+    step = 1000
+    while waited < timeout_ms:
+        _check_voucher_search_error(page)  # lanza VoucherSearchTimeout si hay Error! 1026
+        found = _read_found_count(page)
+        if found and found > 0:
+            return found
+        page.wait_for_timeout(step)
+        waited += step
+    return _read_found_count(page) or 0
 
 
 def add_vouchers_via_search(
@@ -347,17 +398,26 @@ def add_vouchers_via_search(
     vouchers: list[str],
     voucher_from: str | None = None,
     voucher_to: str | None = None,
+    select_all: bool = False,
 ) -> dict:
     """Carga múltiples vouchers usando el modal 'Select Vouchers' (lupa).
 
     Abre el modal desde la Invoice Line activa, aplica filtro VOUCHER FROM/TO,
-    ejecuta SEARCH, selecciona solo las filas del Excel y confirma con OK.
+    ejecuta SEARCH, selecciona y confirma con OK.
+
+    Modos de selección:
+      - select_all=False (default, proveedores chicos): SELECT ALL si los resultados
+        coinciden con el Excel, o clicks individuales por voucher si hay extras.
+      - select_all=True (modo chunked masivo): SELECT ALL siempre, cargando TODO lo
+        pendiente del servidor en el rango. El grid virtualiza (no se puede contar por
+        DOM), así que el conteo cargado se toma del contador 'Found'.
 
     Raises:
         VoucherSearchTimeout: si el servidor TourplanNX expira durante SEARCH.
 
     Returns:
-        {"loaded": [vouchers cargados], "not_found": [vouchers del Excel no hallados en lupa]}
+        {"loaded": [...], "not_found": [...]}  (en modo select_all, "loaded" es un
+        marcador con `found` elementos y "not_found" queda vacío).
     """
     target = {str(v).replace(",", "").strip() for v in vouchers if str(v).strip()}
 
@@ -379,22 +439,45 @@ def add_vouchers_via_search(
     # 4. Click SEARCH (button.tpsearch — evita ambigüedad con "Search for Supplier")
     sv.locator("button.tpsearch").click()
     log.info("    SEARCH ejecutado (FROM=%s TO=%s)...", voucher_from, voucher_to)
-    page.wait_for_timeout(1500)
 
-    # 5. Esperar respuesta; detectar error de timeout del servidor
-    _wait_for_spinner(page)
-    _check_voucher_search_error(page)
-    # Esperar que las filas sean interactivas antes de leer o clickear
+    # 5. Esperar el resultado por el contador 'Found' (NO el spinner, que se cuelga).
+    #    _wait_for_search_results lanza VoucherSearchTimeout si hay Error! 1026.
+    found = _wait_for_search_results(page)
+    log.info("    SEARCH resultados: Found=%d", found)
+
+    # ── Modo masivo: SELECT ALL siempre (carga todo lo pendiente del rango) ──
+    if select_all:
+        if found <= 0:
+            log.warning("    SEARCH sin resultados (Found=0) — saliendo sin cargar")
+            try:
+                sv.get_by_role("button", name="EXIT").click(force=True)
+                sv.wait_for(state="hidden", timeout=MODAL_TIMEOUT)
+            except Exception:
+                pass
+            return {"loaded": [], "not_found": sorted(target)}
+        sv.locator("button.tpselectall").click()
+        # esperar a que OK se habilite (la selección server-side tarda)
+        try:
+            expect(sv.get_by_role("button", name="OK")).to_be_enabled(timeout=MODAL_TIMEOUT)
+        except Exception:
+            pass
+        log.info("    SELECT ALL: %d vouchers (todo lo pendiente del rango)", found)
+        sv.get_by_role("button", name="OK").click()
+        log.info("    OK -> cargando %d lineas...", found)
+        sv.wait_for(state="hidden", timeout=30000)
+        page.wait_for_timeout(800)
+        log.info("    Lupa completada (masivo): %d cargados", found)
+        # 'loaded' es un marcador con `found` elementos (el grid virtualiza, no hay
+        # números exactos); el matching por-voucher no aplica en este modo.
+        return {"loaded": list(range(found)), "not_found": []}
+
+    # ── Modo chico (comportamiento original): matching contra el Excel ──
     try:
         page.locator("tr.tpgrid td.tpcol-vouchernumber").first.wait_for(state="visible", timeout=5000)
     except Exception:
         pass
     page.wait_for_timeout(500)
 
-    # 6. Obtener la lista de vouchers en la tabla de RESULTS, con su índice global en tr.tpgrid.
-    # Las filas son tr.tpgrid dentro de <tp-tab> (NO dentro de dialog[open]).
-    # Se devuelve {index, voucher} para que el click Python use el índice correcto de la página
-    # (puede haber otros tr.tpgrid sin checkbox en el DOM, como el grid de Invoice Lines).
     rows_data: list[dict] = page.evaluate("""
         () => Array.from(document.querySelectorAll('tr.tpgrid'))
                   .map((row, idx) => {
@@ -408,14 +491,10 @@ def add_vouchers_via_search(
     result_set = set(result_vouchers)
 
     if result_set and result_set == target:
-        # Todos los resultados coinciden con el Excel → SELECT ALL (1 click, sin llamadas por fila)
         sv.locator("button.tpselectall").click()
         loaded = list(result_vouchers)
         log.info("    SELECT ALL: %d vouchers (resultados == Excel)", len(loaded))
     else:
-        # Hay extras en TourplanNX → click individual por cada voucher del Excel.
-        # El grid se re-renderiza tras cada round-trip (~2s/fila), por eso se busca el índice
-        # fresco en el DOM antes de cada click (no usar índice estático de rows_data).
         try:
             page.locator("tr.tpgrid td.tpcol-checkbox").first.wait_for(state="visible", timeout=8000)
         except Exception:
@@ -451,7 +530,6 @@ def add_vouchers_via_search(
             pass
         return {"loaded": [], "not_found": sorted(target)}
 
-    # 7. OK → carga todas las líneas seleccionadas y cierra el modal
     sv.get_by_role("button", name="OK").click()
     log.info("    OK -> cargando %d lineas...", len(loaded))
     sv.wait_for(state="hidden", timeout=30000)
