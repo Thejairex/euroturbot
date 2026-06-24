@@ -558,13 +558,16 @@ def abort_transaction(page: Page) -> None:
             page.wait_for_timeout(800)
         except Exception:
             break
-    # Esperar que Angular desmonte todos los <dialog open> del DOM antes de continuar.
-    # Sin esta espera, el tp-dialog en transición intercepta el próximo click INSERT.
+    # Forzar cierre de cualquier <dialog open> residual via el método nativo del navegador.
+    # Angular a veces deja tp-dialog en animación de salida con el atributo open intacto;
+    # dialog.close() elimina el atributo y quita la intercepción de pointer events.
     try:
-        page.wait_for_function(
-            "() => document.querySelectorAll('dialog[open]').length === 0",
-            timeout=8000,
+        remaining = page.evaluate(
+            "() => { const ds = document.querySelectorAll('dialog[open]');"
+            " ds.forEach(d => d.close()); return ds.length; }"
         )
+        if remaining:
+            page.wait_for_timeout(300)
     except Exception:
         pass
     log.info("  abort_transaction: modales cerrados")

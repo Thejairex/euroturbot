@@ -119,7 +119,7 @@ def _cargar_chunk_factura(page, supplier_code, currency, chunk_records, select_a
     ref = f"INV{chunk_records[0]['row_index']}{supplier_code}"
 
     try:
-        page.locator("#creditorview").get_by_role("button", name="INSERT").click(force=True)
+        page.locator("#creditorview").get_by_role("button", name="INSERT").click()
         create_bulk_transaction(page, total, currency, ref)
         confirm_bulk_transaction(page)
         result = add_vouchers_via_search(page, vouchers, vfrom, vto, select_all=select_all)
@@ -275,7 +275,7 @@ def process_row(page, row: dict, row_index: int, filename: str, tracker: Process
     try:
         open_supplier(page, supplier_code)
         navigate_to_transactions(page)
-        page.locator("#creditorview").get_by_role("button", name="INSERT").click(force=True)
+        page.locator("#creditorview").get_by_role("button", name="INSERT").click()
         create_transaction(page, row, row_index)
         page.get_by_role("dialog").get_by_role("button", name="EXIT").click()
         page.get_by_role("dialog").wait_for(state="hidden", timeout=5000)
@@ -412,7 +412,7 @@ def process_supplier_group(
 
             stats.set_activity(currency=currency, voucher_total=len(records_for_currency), voucher_idx=0)
 
-            page.locator("#creditorview").get_by_role("button", name="INSERT").click(force=True)
+            page.locator("#creditorview").get_by_role("button", name="INSERT").click()
             create_bulk_transaction(page, total, currency, reference)
             confirm_bulk_transaction(page)
 
