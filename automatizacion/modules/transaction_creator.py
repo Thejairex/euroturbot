@@ -136,7 +136,10 @@ def confirm_bulk_transaction(page: Page) -> None:
     ok_btn = dialog.get_by_role("button", name="OK")
     expect(ok_btn).to_be_enabled(timeout=MODAL_TIMEOUT)
     ok_btn.click()
-    page.locator(VOUCHER_INPUT).wait_for(state="visible", timeout=MODAL_TIMEOUT)
+    # VOUCHER_INPUT también existe en el Create Transaction form (campo Voucher No.)
+    # y en los tp-dialog del pool de Angular — matchea múltiples elementos (strict mode).
+    # "Search for Voucher" es exclusivo de la Invoice Line: no está en Create Transaction.
+    page.get_by_role("button", name="Search for Voucher").wait_for(state="visible", timeout=MODAL_TIMEOUT)
     log.info("  Create Transaction confirmado — Insert Invoice + Invoice Line abiertos")
 
 
@@ -154,8 +157,9 @@ def add_voucher_line(page: Page, voucher_number: str, is_first: bool) -> None:
         dialog = page.get_by_role("dialog")
         dialog.locator(INVOICE_INSERT).wait_for(state="visible", timeout=MODAL_TIMEOUT)
         dialog.locator(INVOICE_INSERT).click(force=True)
-        # Esperar el input editable antes de continuar (igual que confirm_bulk_transaction)
-        page.locator(VOUCHER_INPUT).wait_for(state="visible", timeout=MODAL_TIMEOUT)
+        # Igual que confirm_bulk_transaction: usar lupa en lugar de VOUCHER_INPUT
+        # para evitar strict mode en el pool de tp-dialog de Angular.
+        page.get_by_role("button", name="Search for Voucher").wait_for(state="visible", timeout=MODAL_TIMEOUT)
 
     # El input del voucher está en la última Invoice Line abierta (el último dialog)
     invoice_line = page.get_by_role("dialog").last
@@ -559,15 +563,15 @@ def abort_transaction(page: Page) -> None:
         except Exception:
             break
     # Forzar cierre de cualquier <dialog open> residual via el método nativo del navegador.
-    # Angular a veces deja tp-dialog en animación de salida con el atributo open intacto;
+    # Angular deja tp-dialog en animación de salida con el atributo open intacto;
     # dialog.close() elimina el atributo y quita la intercepción de pointer events.
+    # NO se remueven los tp-dialog del DOM: Angular los gestiona con un pool pre-creado
+    # indexado por nth-child; removerlos corrompería ese pool.
     try:
-        remaining = page.evaluate(
-            "() => { const ds = document.querySelectorAll('dialog[open]');"
-            " ds.forEach(d => d.close()); return ds.length; }"
+        page.evaluate(
+            "() => document.querySelectorAll('dialog[open]').forEach(d => d.close())"
         )
-        if remaining:
-            page.wait_for_timeout(300)
+        page.wait_for_timeout(300)
     except Exception:
         pass
     log.info("  abort_transaction: modales cerrados")
