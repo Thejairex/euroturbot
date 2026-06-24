@@ -42,7 +42,12 @@ def _wait_for_spinner(page: Page) -> None:
         page.locator(".spinner").wait_for(state="visible", timeout=3000)
     except Exception:
         pass
-    page.locator(".spinner").wait_for(state="hidden", timeout=15000)
+    try:
+        page.locator(".spinner").wait_for(state="hidden", timeout=60000)
+    except Exception:
+        # El spinner de TourplanNX a veces queda colgado indefinidamente aunque el
+        # servidor terminó de procesar. Continuar igual — el form puede estar listo.
+        log.warning("  Spinner sigue visible tras 60s — continuando")
 
 
 def fill_currency(page: Page, currency_code: str) -> None:
