@@ -100,17 +100,41 @@ def chunk_records_for_invoice(
     return bloques
 
 
-def _read_existing_references(page, supplier_code: str) -> set[str]:
-    """Consulta la API GetAccountingTransactions para obtener todas las referencias
-    INV* ya existentes en TourplanNX para este proveedor.
+def _classify_by_loaded(
+    records: list[dict], loaded_vouchers: set[str]
+) -> tuple[list[int], list[int]]:
+    """Clasifica row_indices según si su voucher está en loaded_vouchers.
 
-    Usa fetch() desde el mismo contexto del browser (cookies de sesión incluidas),
-    así no depende del DOM virtualizado de la grilla ni necesita scroll.
+    Si loaded_vouchers está vacío (el campo de voucher no se pudo leer de la API),
+    se tratan todos como ok — fallback seguro.
 
-    Devuelve set vacío si la API falla o no hay transacciones previas.
+    Returns:
+        (ok_indices, skipped_indices)
+    """
+    if not loaded_vouchers:
+        return [r["row_index"] for r in records], []
+    ok, skipped = [], []
+    for r in records:
+        vnorm = str(r.get("voucher", "")).replace(",", "").strip()
+        if vnorm in loaded_vouchers:
+            ok.append(r["row_index"])
+        else:
+            skipped.append(r["row_index"])
+    return ok, skipped
+
+
+def _read_existing_references(page, supplier_code: str) -> dict[str, set[str]]:
+    """Consulta la API GetAccountingTransactions para obtener referencias INV* existentes
+    y los vouchers que contiene cada una.
+
+    Devuelve {reference: {voucher_str, ...}}. Si no se puede leer el campo de voucher
+    para una referencia, su set queda vacío — el caller debe tratar eso como "todos ok"
+    (fallback seguro: no marcar nada como skipped sin evidencia).
+
+    Devuelve {} si la API falla o no hay transacciones previas.
     """
     try:
-        refs = page.evaluate("""
+        raw = page.evaluate("""
             async (code) => {
                 const resp = await fetch(
                     '/tourplannx/tourplanservices/Services/Accounting.svc/json/GetAccountingTransactions',
@@ -128,23 +152,43 @@ def _read_existing_references(page, supplier_code: str) -> set[str]:
                         }})
                     }
                 );
-                if (!resp.ok) return [];
+                if (!resp.ok) return {};
                 const data = await resp.json();
                 const lines = data.AccountingTransactionLines || [];
-                const refs = new Set(
-                    lines.map(l => l.TransactionReference)
-                         .filter(r => r && r.startsWith('INV'))
-                );
-                return Array.from(refs);
+                // Log claves de la primera línea INV* para detectar el campo de voucher
+                const firstInv = lines.find(l => l.TransactionReference && l.TransactionReference.startsWith('INV'));
+                const fieldKeys = firstInv ? Object.keys(firstInv) : [];
+                const result = {};
+                for (const l of lines) {
+                    if (!l.TransactionReference || !l.TransactionReference.startsWith('INV')) continue;
+                    const ref = l.TransactionReference;
+                    if (!result[ref]) result[ref] = [];
+                    // Intentar varios nombres de campo para el número de voucher
+                    const vno = l.VoucherNo || l.VoucherNumber || l.Voucher || l.VoucherRef || '';
+                    const vstr = String(vno).replace(/,/g, '').trim();
+                    if (vstr && vstr !== '0' && vstr !== 'null' && vstr !== 'undefined') {
+                        result[ref].push(vstr);
+                    }
+                }
+                return {refs: result, fieldKeys};
             }
         """, supplier_code)
-        result = set(refs or [])
-        log.info("  [DEBUG] Referencias INV* existentes en TourplanNX (%d): %s",
-                 len(result), sorted(result))
+        raw = raw or {}
+        field_keys = raw.get("fieldKeys", [])
+        refs_raw = raw.get("refs", {})
+        result: dict[str, set[str]] = {ref: set(vs) for ref, vs in refs_raw.items()}
+        inv_refs = [r for r in result if r.startswith("INV")]
+        log.info("  [DEBUG] Referencias INV* en TourplanNX (%d): %s", len(inv_refs), sorted(inv_refs))
+        if field_keys:
+            log.info("  [DEBUG] Campos API línea: %s", field_keys)
+        # Advertir si no se encontraron vouchers en ninguna referencia (campo desconocido)
+        refs_sin_vouchers = [r for r in result if not result[r]]
+        if refs_sin_vouchers and len(refs_sin_vouchers) == len(result):
+            log.warning("  [DEBUG] No se leyeron vouchers de la API (campo desconocido) — se usará fallback ok")
         return result
     except Exception as exc:
         log.warning("  [DEBUG] _read_existing_references falló: %s", exc)
-        return set()
+        return {}
 
 
 def _cargar_chunk_factura(
@@ -476,18 +520,29 @@ def process_supplier_group(
                               ci, len(chunks), chunk_ref,
                               "SÍ (saltando)" if chunk_ref in existing_refs else "NO (procesar)")
                     if chunk_ref in existing_refs:
-                        # Ya guardado en TourplanNX — marcar ok y saltar sin procesar
-                        log.info("    Factura %d/%d ya existe en TourplanNX (ref=%s) — saltando",
-                                 ci, len(chunks), chunk_ref)
-                        for idx in chunk_indices:
+                        loaded_vouchers = existing_refs[chunk_ref]
+                        log.info("    Factura %d/%d ya existe en TourplanNX (ref=%s, %d vouchers en API) — saltando",
+                                 ci, len(chunks), chunk_ref, len(loaded_vouchers))
+                        ok_idx, skip_idx = _classify_by_loaded(
+                            chunk["records"], loaded_vouchers)
+                        for idx in ok_idx:
                             per_row_status[idx] = "ok"
                             stats.add_voucher_result({
                                 "filename": filename, "supplier_code": supplier_code,
                                 "voucher": "", "currency": currency,
                                 "status": "ok", "error": None, "row_index": idx,
                             })
+                        for idx in skip_idx:
+                            per_row_status[idx] = "skipped"
+                            stats.add_voucher_result({
+                                "filename": filename, "supplier_code": supplier_code,
+                                "voucher": "", "currency": currency,
+                                "status": "skipped", "error": "No cargado en corrida anterior",
+                                "row_index": idx,
+                            })
                         if tracker and filename:
-                            tracker.mark_rows_ok_bulk(filename, chunk_indices)
+                            tracker.mark_rows_ok_bulk(filename, ok_idx)
+                            tracker.mark_rows_skipped_bulk(filename, skip_idx)
                         continue
                     log.info("    Factura %d/%d: %d vouchers (rango %s-%s)",
                              ci, len(chunks), len(chunk["records"]), chunk["vfrom"], chunk["vto"])
@@ -515,17 +570,28 @@ def process_supplier_group(
 
             # Evitar duplicar si la factura ya existe en TourplanNX
             if reference in existing_refs:
-                log.info("    Moneda %s ref=%s ya existe en TourplanNX — saltando", currency, reference)
-                indices = [r["row_index"] for r in records_for_currency]
-                for idx in indices:
+                loaded_vouchers = existing_refs[reference]
+                log.info("    Moneda %s ref=%s ya existe en TourplanNX (%d vouchers en API) — saltando",
+                         currency, reference, len(loaded_vouchers))
+                ok_idx, skip_idx = _classify_by_loaded(records_for_currency, loaded_vouchers)
+                for idx in ok_idx:
                     per_row_status[idx] = "ok"
                     stats.add_voucher_result({
                         "filename": filename, "supplier_code": supplier_code,
                         "voucher": "", "currency": currency,
                         "status": "ok", "error": None, "row_index": idx,
                     })
+                for idx in skip_idx:
+                    per_row_status[idx] = "skipped"
+                    stats.add_voucher_result({
+                        "filename": filename, "supplier_code": supplier_code,
+                        "voucher": "", "currency": currency,
+                        "status": "skipped", "error": "No cargado en corrida anterior",
+                        "row_index": idx,
+                    })
                 if tracker and filename:
-                    tracker.mark_rows_ok_bulk(filename, indices)
+                    tracker.mark_rows_ok_bulk(filename, ok_idx)
+                    tracker.mark_rows_skipped_bulk(filename, skip_idx)
                 continue
 
             stats.set_activity(currency=currency, voucher_total=len(records_for_currency), voucher_idx=0)
