@@ -141,7 +141,7 @@ class ProcessTracker:
                 for r in self._conn.execute("PRAGMA table_info(processed_rows)")
             }
 
-        for col in ("supplier_code", "currency"):
+        for col in ("supplier_code", "currency", "transaction_reference"):
             if col not in existing:
                 self._execute(f"ALTER TABLE processed_rows ADD COLUMN {col} TEXT")
 
@@ -307,15 +307,22 @@ class ProcessTracker:
         )
         self._conn.commit()
 
-    def mark_rows_ok_bulk(self, filename: str, row_indices: list[int]):
+    def mark_rows_ok_bulk(self, filename: str, row_indices: list[int], reference: str | None = None):
         if not row_indices:
             return
         now = time.strftime("%Y-%m-%d %H:%M:%S")
-        self._executemany(
-            "UPDATE processed_rows SET status = 'ok', processed_at = %s "
-            "WHERE filename = %s AND row_index = %s",
-            [(now, filename, idx) for idx in row_indices],
-        )
+        if reference:
+            self._executemany(
+                "UPDATE processed_rows SET status = 'ok', processed_at = %s, transaction_reference = %s "
+                "WHERE filename = %s AND row_index = %s",
+                [(now, reference, filename, idx) for idx in row_indices],
+            )
+        else:
+            self._executemany(
+                "UPDATE processed_rows SET status = 'ok', processed_at = %s "
+                "WHERE filename = %s AND row_index = %s",
+                [(now, filename, idx) for idx in row_indices],
+            )
         self._conn.commit()
 
     def mark_rows_failed_bulk(self, filename: str, row_indices: list[int], error: str):

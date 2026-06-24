@@ -231,7 +231,7 @@ def _cargar_chunk_factura(
             except Exception:
                 pass
             if tracker and filename:
-                tracker.mark_rows_ok_bulk(filename, indices)
+                tracker.mark_rows_ok_bulk(filename, indices, reference=ref)
             return (indices, [])
         result = add_vouchers_via_search(page, vouchers, vfrom, vto, select_all=select_all)
         if len(result["loaded"]) == 0:
@@ -247,7 +247,7 @@ def _cargar_chunk_factura(
         save_invoice(page)
         log.info("    Factura guardada: %d filas (%s)", len(indices), currency)
         if tracker and filename:
-            tracker.mark_rows_ok_bulk(filename, indices)
+            tracker.mark_rows_ok_bulk(filename, indices, reference=ref)
             log.info("  [DEBUG] Tracker: %d filas → ok (ref=%s)", len(indices), ref)
         return (indices, [])
     except VoucherSearchTimeout:
@@ -541,7 +541,7 @@ def process_supplier_group(
                                 "row_index": idx,
                             })
                         if tracker and filename:
-                            tracker.mark_rows_ok_bulk(filename, ok_idx)
+                            tracker.mark_rows_ok_bulk(filename, ok_idx, reference=chunk_ref)
                             tracker.mark_rows_skipped_bulk(filename, skip_idx)
                         continue
                     log.info("    Factura %d/%d: %d vouchers (rango %s-%s)",
@@ -590,7 +590,7 @@ def process_supplier_group(
                         "row_index": idx,
                     })
                 if tracker and filename:
-                    tracker.mark_rows_ok_bulk(filename, ok_idx)
+                    tracker.mark_rows_ok_bulk(filename, ok_idx, reference=reference)
                     tracker.mark_rows_skipped_bulk(filename, skip_idx)
                 continue
 
@@ -618,7 +618,7 @@ def process_supplier_group(
                         "status": "ok", "error": None, "row_index": idx,
                     })
                 if tracker and filename:
-                    tracker.mark_rows_ok_bulk(filename, indices)
+                    tracker.mark_rows_ok_bulk(filename, indices, reference=reference)
                 continue
 
             # Calcular rango VOUCHER FROM/TO para acotar la búsqueda en el servidor
