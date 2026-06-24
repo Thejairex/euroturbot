@@ -28,6 +28,11 @@ class VoucherSearchTimeout(Exception):
     pass
 
 
+class ReferenceExistsError(Exception):
+    """TourplanNX rechazó la transacción con error 1038: la referencia ya existe."""
+    pass
+
+
 def _wait_for_spinner(page: Page) -> None:
     try:
         page.locator(".spinner").wait_for(state="visible", timeout=3000)
@@ -136,12 +141,26 @@ def confirm_bulk_transaction(page: Page) -> None:
     ok_btn = dialog.get_by_role("button", name="OK")
     expect(ok_btn).to_be_enabled(timeout=MODAL_TIMEOUT)
     ok_btn.click()
-    log.info("  [DEBUG] confirm_bulk_transaction: esperando botón 'Search for Voucher' (Invoice Line)...")
-    # VOUCHER_INPUT también existe en el Create Transaction form (campo Voucher No.)
-    # y en los tp-dialog del pool de Angular — matchea múltiples elementos (strict mode).
-    # "Search for Voucher" es exclusivo de la Invoice Line: no está en Create Transaction.
-    page.get_by_role("button", name="Search for Voucher").wait_for(state="visible", timeout=MODAL_TIMEOUT)
-    log.info("  [DEBUG] confirm_bulk_transaction: 'Search for Voucher' visible — Invoice Line abierta")
+    # No esperar aquí: el wait real es lupa.wait_for() dentro de add_vouchers_via_search.
+    # El wait original (VOUCHER_INPUT) matcheaba el Create Transaction form mismo —
+    # era instantáneo pero falso. "Search for Voucher" no aparece a tiempo desde acá.
+    page.wait_for_timeout(500)
+    # Detectar error 1038 "Reference Exists" u otro error de TourplanNX tras el OK.
+    # Si aparece un modal de error, cerrarlo y lanzar excepción para que el pipeline
+    # pueda abortar y saltar la transacción sin quedar colgado.
+    error_dialog = page.locator("tp-dialog").filter(has_text="Error!")
+    if error_dialog.count() > 0:
+        error_text = (error_dialog.last.inner_text() or "").strip()
+        log.warning("  Error TourplanNX tras OK: %s", error_text)
+        try:
+            error_dialog.last.get_by_role("button").last.click(force=True)
+            page.wait_for_timeout(300)
+        except Exception:
+            pass
+        if "Reference Exists" in error_text:
+            raise ReferenceExistsError(f"1038 Reference Exists: {error_text}")
+        raise Exception(f"TourplanNX error tras OK: {error_text}")
+    log.info("  Create Transaction confirmado (OK clickeado)")
 
 
 def add_voucher_line(page: Page, voucher_number: str, is_first: bool) -> None:

@@ -28,6 +28,7 @@ from modules.transaction_creator import (
     save_invoice,
     abort_transaction,
     VoucherSearchTimeout,
+    ReferenceExistsError,
 )
 from utils.logger import log
 
@@ -99,37 +100,47 @@ def chunk_records_for_invoice(
     return bloques
 
 
-def _read_existing_references(page) -> set[str]:
-    """Lee las referencias de transacciones ya existentes en la grilla de Transactions.
+def _read_existing_references(page, supplier_code: str) -> set[str]:
+    """Consulta la API GetAccountingTransactions para obtener todas las referencias
+    INV* ya existentes en TourplanNX para este proveedor.
 
-    Escanea todas las celdas de tr.tpgrid buscando valores que comiencen con 'INV'
-    (nuestro prefijo de referencia). Permite detectar chunks ya guardados en TourplanNX
-    para saltarlos sin duplicar, independientemente del estado del tracker.
+    Usa fetch() desde el mismo contexto del browser (cookies de sesión incluidas),
+    así no depende del DOM virtualizado de la grilla ni necesita scroll.
 
-    Devuelve set vacío si la grilla no está visible o el evaluate falla.
+    Devuelve set vacío si la API falla o no hay transacciones previas.
     """
     try:
-        all_cells = page.evaluate("""
-            () => {
-                const cells = [];
-                document.querySelectorAll('tr.tpgrid td').forEach(td => {
-                    const t = (td.textContent || '').trim();
-                    if (t) cells.push(t);
-                });
-                return cells;
+        refs = page.evaluate("""
+            async (code) => {
+                const resp = await fetch(
+                    '/tourplannx/tourplanservices/Services/Accounting.svc/json/GetAccountingTransactions',
+                    {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+                        body: JSON.stringify({request: {
+                            Code: code,
+                            Ledger: 'AccountsPayable',
+                            InCurrency: null,
+                            Branch: null,
+                            OrderBy: 'TranDate',
+                            ShowTrans: 'All',
+                            DateFrom: '2019-10-01T00:00:00'
+                        }})
+                    }
+                );
+                if (!resp.ok) return [];
+                const data = await resp.json();
+                const lines = data.AccountingTransactionLines || [];
+                const refs = new Set(
+                    lines.map(l => l.TransactionReference)
+                         .filter(r => r && r.startsWith('INV'))
+                );
+                return Array.from(refs);
             }
-        """) or []
-        log.info("  [DEBUG] _read_existing_references: %d celdas leídas de tr.tpgrid td",
-                  len(all_cells))
-        if all_cells:
-            log.info("  [DEBUG] Muestra de celdas (primeras 20): %s", all_cells[:20])
-        refs = [t for t in all_cells if t.startswith("INV") and len(t) > 3]
-        result = set(refs)
-        if result:
-            log.info("  [DEBUG] Referencias INV* encontradas (%d): %s",
-                     len(result), sorted(result))
-        else:
-            log.info("  [DEBUG] Sin referencias INV* en la grilla (grilla vacía o selector distinto)")
+        """, supplier_code)
+        result = set(refs or [])
+        log.info("  [DEBUG] Referencias INV* existentes en TourplanNX (%d): %s",
+                 len(result), sorted(result))
         return result
     except Exception as exc:
         log.warning("  [DEBUG] _read_existing_references falló: %s", exc)
@@ -165,7 +176,19 @@ def _cargar_chunk_factura(
     try:
         page.locator("#creditorview").get_by_role("button", name="INSERT").click()
         create_bulk_transaction(page, total, currency, ref)
-        confirm_bulk_transaction(page)
+        try:
+            confirm_bulk_transaction(page)
+        except ReferenceExistsError:
+            # La referencia ya existe en TourplanNX (no la detectó _read_existing_references).
+            # Marcar ok: la factura está guardada.
+            log.info("    Chunk %s: 1038 Reference Exists — ya guardado, marcando %d filas ok", ref, len(indices))
+            try:
+                abort_transaction(page)
+            except Exception:
+                pass
+            if tracker and filename:
+                tracker.mark_rows_ok_bulk(filename, indices)
+            return (indices, [])
         result = add_vouchers_via_search(page, vouchers, vfrom, vto, select_all=select_all)
         if len(result["loaded"]) == 0:
             log.warning("    Chunk sin vouchers cargados (%s) — abortando", currency)
@@ -421,9 +444,10 @@ def process_supplier_group(
         open_supplier(page, supplier_code)
         navigate_to_transactions(page)
 
-        # Leer referencias ya existentes en TourplanNX para evitar duplicar chunks
-        # que se guardaron en corridas anteriores (fuente de verdad: la propia grilla).
-        existing_refs = _read_existing_references(page) if es_masivo else set()
+        # Leer referencias INV* ya existentes en TourplanNX para este proveedor.
+        # Se corre para TODOS los proveedores (masivos y no-masivos) para prevenir el
+        # error 1038 "Reference Exists" que deja el pipeline colgado sin manejar.
+        existing_refs = _read_existing_references(page, supplier_code)
 
         for currency, total in group["total_by_currency"].items():
             # Chequear stop antes de abrir INSERT (no hay modal abierto)
@@ -489,11 +513,47 @@ def process_supplier_group(
             log.info("    Moneda %s: total=%.2f, ref=%s, %d vouchers",
                      currency, total, reference, len(records_for_currency))
 
+            # Evitar duplicar si la factura ya existe en TourplanNX
+            if reference in existing_refs:
+                log.info("    Moneda %s ref=%s ya existe en TourplanNX — saltando", currency, reference)
+                indices = [r["row_index"] for r in records_for_currency]
+                for idx in indices:
+                    per_row_status[idx] = "ok"
+                    stats.add_voucher_result({
+                        "filename": filename, "supplier_code": supplier_code,
+                        "voucher": "", "currency": currency,
+                        "status": "ok", "error": None, "row_index": idx,
+                    })
+                if tracker and filename:
+                    tracker.mark_rows_ok_bulk(filename, indices)
+                continue
+
             stats.set_activity(currency=currency, voucher_total=len(records_for_currency), voucher_idx=0)
 
             page.locator("#creditorview").get_by_role("button", name="INSERT").click()
             create_bulk_transaction(page, total, currency, reference)
-            confirm_bulk_transaction(page)
+            try:
+                confirm_bulk_transaction(page)
+            except ReferenceExistsError:
+                # TourplanNX rechazó: la referencia ya existe pero no estaba en la API
+                # (raro, pero puede pasar si la API tardó o la referencia es de otra corrida).
+                log.info("    1038 Reference Exists para %s/%s — marcando ok y saltando",
+                         supplier_code, currency)
+                try:
+                    abort_transaction(page)
+                except Exception:
+                    pass
+                indices = [r["row_index"] for r in records_for_currency]
+                for idx in indices:
+                    per_row_status[idx] = "ok"
+                    stats.add_voucher_result({
+                        "filename": filename, "supplier_code": supplier_code,
+                        "voucher": "", "currency": currency,
+                        "status": "ok", "error": None, "row_index": idx,
+                    })
+                if tracker and filename:
+                    tracker.mark_rows_ok_bulk(filename, indices)
+                continue
 
             # Calcular rango VOUCHER FROM/TO para acotar la búsqueda en el servidor
             try:
