@@ -99,9 +99,53 @@ def chunk_records_for_invoice(
     return bloques
 
 
-def _cargar_chunk_factura(page, supplier_code, currency, chunk_records, select_all, piso=25):
+def _read_existing_references(page) -> set[str]:
+    """Lee las referencias de transacciones ya existentes en la grilla de Transactions.
+
+    Escanea todas las celdas de tr.tpgrid buscando valores que comiencen con 'INV'
+    (nuestro prefijo de referencia). Permite detectar chunks ya guardados en TourplanNX
+    para saltarlos sin duplicar, independientemente del estado del tracker.
+
+    Devuelve set vacío si la grilla no está visible o el evaluate falla.
+    """
+    try:
+        all_cells = page.evaluate("""
+            () => {
+                const cells = [];
+                document.querySelectorAll('tr.tpgrid td').forEach(td => {
+                    const t = (td.textContent || '').trim();
+                    if (t) cells.push(t);
+                });
+                return cells;
+            }
+        """) or []
+        log.info("  [DEBUG] _read_existing_references: %d celdas leídas de tr.tpgrid td",
+                  len(all_cells))
+        if all_cells:
+            log.info("  [DEBUG] Muestra de celdas (primeras 20): %s", all_cells[:20])
+        refs = [t for t in all_cells if t.startswith("INV") and len(t) > 3]
+        result = set(refs)
+        if result:
+            log.info("  [DEBUG] Referencias INV* encontradas (%d): %s",
+                     len(result), sorted(result))
+        else:
+            log.info("  [DEBUG] Sin referencias INV* en la grilla (grilla vacía o selector distinto)")
+        return result
+    except Exception as exc:
+        log.warning("  [DEBUG] _read_existing_references falló: %s", exc)
+        return set()
+
+
+def _cargar_chunk_factura(
+    page, supplier_code, currency, chunk_records, select_all, piso=25,
+    tracker=None, filename=None,
+):
     """Carga un chunk de records como UNA factura (INSERT → create_bulk → confirm →
     lupa SELECT ALL → SAVE).
+
+    Actualiza el tracker inmediatamente al terminar cada chunk (ok o failed), de modo
+    que un reinicio solo reintenta los chunks que realmente fallaron sin duplicar los
+    que ya se guardaron en TourplanNX.
 
     Si el SEARCH da timeout (VoucherSearchTimeout), aborta y sub-divide el chunk por
     rango (mitades) reintentando cada mitad como su propia factura, hasta un piso de
@@ -126,6 +170,8 @@ def _cargar_chunk_factura(page, supplier_code, currency, chunk_records, select_a
         if len(result["loaded"]) == 0:
             log.warning("    Chunk sin vouchers cargados (%s) — abortando", currency)
             abort_transaction(page)
+            if tracker and filename:
+                tracker.mark_rows_failed_bulk(filename, indices, "Sin vouchers cargados en lupa")
             return ([], indices)
         totals = read_invoice_totals(page)
         rem = abs(totals.get("remainder", 9999))
@@ -133,6 +179,9 @@ def _cargar_chunk_factura(page, supplier_code, currency, chunk_records, select_a
             log.warning("    REMAINDER=%.2f en chunk %s — guardando igual", totals.get("remainder", 0), currency)
         save_invoice(page)
         log.info("    Factura guardada: %d filas (%s)", len(indices), currency)
+        if tracker and filename:
+            tracker.mark_rows_ok_bulk(filename, indices)
+            log.info("  [DEBUG] Tracker: %d filas → ok (ref=%s)", len(indices), ref)
         return (indices, [])
     except VoucherSearchTimeout:
         try:
@@ -142,12 +191,16 @@ def _cargar_chunk_factura(page, supplier_code, currency, chunk_records, select_a
         if len(chunk_records) <= piso:
             log.error("    Chunk mínimo (%d) sigue en timeout — marcando %d filas failed",
                       len(chunk_records), len(indices))
+            if tracker and filename:
+                tracker.mark_rows_failed_bulk(filename, indices, "VoucherSearchTimeout en chunk mínimo")
             return ([], indices)
         mid = len(chunk_records) // 2
         log.warning("    VoucherSearchTimeout en chunk de %d (%s) — sub-dividiendo en %d + %d",
                     len(chunk_records), currency, mid, len(chunk_records) - mid)
-        ok1, f1 = _cargar_chunk_factura(page, supplier_code, currency, chunk_records[:mid], select_all, piso)
-        ok2, f2 = _cargar_chunk_factura(page, supplier_code, currency, chunk_records[mid:], select_all, piso)
+        ok1, f1 = _cargar_chunk_factura(
+            page, supplier_code, currency, chunk_records[:mid], select_all, piso, tracker, filename)
+        ok2, f2 = _cargar_chunk_factura(
+            page, supplier_code, currency, chunk_records[mid:], select_all, piso, tracker, filename)
         return (ok1 + ok2, f1 + f2)
     except Exception as e:
         # Cualquier otro fallo del chunk (SAVE colgado, modal inesperado, etc.): abortar
@@ -157,6 +210,8 @@ def _cargar_chunk_factura(page, supplier_code, currency, chunk_records, select_a
             abort_transaction(page)
         except Exception:
             pass
+        if tracker and filename:
+            tracker.mark_rows_failed_bulk(filename, indices, str(e))
         return ([], indices)
 
 
@@ -366,6 +421,10 @@ def process_supplier_group(
         open_supplier(page, supplier_code)
         navigate_to_transactions(page)
 
+        # Leer referencias ya existentes en TourplanNX para evitar duplicar chunks
+        # que se guardaron en corridas anteriores (fuente de verdad: la propia grilla).
+        existing_refs = _read_existing_references(page) if es_masivo else set()
+
         for currency, total in group["total_by_currency"].items():
             # Chequear stop antes de abrir INSERT (no hay modal abierto)
             if stop_event and stop_event.is_set():
@@ -387,10 +446,30 @@ def process_supplier_group(
                 for ci, chunk in enumerate(chunks, 1):
                     if stop_event and stop_event.is_set():
                         raise PipelineStopped()
+                    chunk_ref = f"INV{chunk['records'][0]['row_index']}{supplier_code}"
+                    chunk_indices = [r["row_index"] for r in chunk["records"]]
+                    log.info("  [DEBUG] Chunk %d/%d ref=%s — existentes: %s",
+                              ci, len(chunks), chunk_ref,
+                              "SÍ (saltando)" if chunk_ref in existing_refs else "NO (procesar)")
+                    if chunk_ref in existing_refs:
+                        # Ya guardado en TourplanNX — marcar ok y saltar sin procesar
+                        log.info("    Factura %d/%d ya existe en TourplanNX (ref=%s) — saltando",
+                                 ci, len(chunks), chunk_ref)
+                        for idx in chunk_indices:
+                            per_row_status[idx] = "ok"
+                            stats.add_voucher_result({
+                                "filename": filename, "supplier_code": supplier_code,
+                                "voucher": "", "currency": currency,
+                                "status": "ok", "error": None, "row_index": idx,
+                            })
+                        if tracker and filename:
+                            tracker.mark_rows_ok_bulk(filename, chunk_indices)
+                        continue
                     log.info("    Factura %d/%d: %d vouchers (rango %s-%s)",
                              ci, len(chunks), len(chunk["records"]), chunk["vfrom"], chunk["vto"])
                     ok_idx, failed_idx = _cargar_chunk_factura(
-                        page, supplier_code, currency, chunk["records"], select_all=True)
+                        page, supplier_code, currency, chunk["records"], select_all=True,
+                        tracker=tracker, filename=filename)
                     for idx in ok_idx:
                         per_row_status[idx] = "ok"
                         stats.add_voucher_result({

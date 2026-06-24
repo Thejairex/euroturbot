@@ -136,11 +136,12 @@ def confirm_bulk_transaction(page: Page) -> None:
     ok_btn = dialog.get_by_role("button", name="OK")
     expect(ok_btn).to_be_enabled(timeout=MODAL_TIMEOUT)
     ok_btn.click()
+    log.info("  [DEBUG] confirm_bulk_transaction: esperando botón 'Search for Voucher' (Invoice Line)...")
     # VOUCHER_INPUT también existe en el Create Transaction form (campo Voucher No.)
     # y en los tp-dialog del pool de Angular — matchea múltiples elementos (strict mode).
     # "Search for Voucher" es exclusivo de la Invoice Line: no está en Create Transaction.
     page.get_by_role("button", name="Search for Voucher").wait_for(state="visible", timeout=MODAL_TIMEOUT)
-    log.info("  Create Transaction confirmado — Insert Invoice + Invoice Line abiertos")
+    log.info("  [DEBUG] confirm_bulk_transaction: 'Search for Voucher' visible — Invoice Line abierta")
 
 
 def add_voucher_line(page: Page, voucher_number: str, is_first: bool) -> None:

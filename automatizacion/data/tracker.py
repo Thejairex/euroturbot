@@ -307,6 +307,28 @@ class ProcessTracker:
         )
         self._conn.commit()
 
+    def mark_rows_ok_bulk(self, filename: str, row_indices: list[int]):
+        if not row_indices:
+            return
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._executemany(
+            "UPDATE processed_rows SET status = 'ok', processed_at = %s "
+            "WHERE filename = %s AND row_index = %s",
+            [(now, filename, idx) for idx in row_indices],
+        )
+        self._conn.commit()
+
+    def mark_rows_failed_bulk(self, filename: str, row_indices: list[int], error: str):
+        if not row_indices:
+            return
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._executemany(
+            "UPDATE processed_rows SET status = 'failed', error = %s, processed_at = %s "
+            "WHERE filename = %s AND row_index = %s",
+            [(error, now, filename, idx) for idx in row_indices],
+        )
+        self._conn.commit()
+
     def mark_rows_skipped_bulk(self, filename: str, row_indices: list[int]):
         if not row_indices:
             return
