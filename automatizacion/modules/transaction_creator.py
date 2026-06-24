@@ -3,6 +3,10 @@ from playwright.sync_api import Page, expect
 from utils.logger import log
 
 MODAL_TIMEOUT = 30000
+# Espera máxima para que el botón lupa ("Search for Voucher") aparezca después de OK.
+# El servidor puede tardar > 30s en abrir Insert Invoice para proveedores grandes.
+# Si supera este límite se lanza VoucherSearchTimeout → activa subdivisión del chunk.
+LUPA_VISIBLE_TIMEOUT = 90000
 # Espera máxima para que el modal Insert Invoice cierre tras SAVE (el spinner queda
 # colgado, así que la señal real es el cierre del modal). CreateAPInvoice con muchas
 # líneas tarda; con chunks de ~200 debería cerrar en pocos segundos.
@@ -456,10 +460,18 @@ def add_vouchers_via_search(
     """
     target = {str(v).replace(",", "").strip() for v in vouchers if str(v).strip()}
 
-    # 1. Click botón lupa ("Search for Voucher") desde la Invoice Line activa
+    # 1. Click botón lupa ("Search for Voucher") desde la Invoice Line activa.
+    # Usar LUPA_VISIBLE_TIMEOUT (90s) porque el servidor puede tardar en abrir
+    # Insert Invoice tras el OK del Create Transaction (especialmente proveedores grandes).
+    # Si supera el límite → VoucherSearchTimeout para activar subdivisión del chunk.
     invoice_line = page.get_by_role("dialog").last
     lupa = invoice_line.get_by_role("button", name="Search for Voucher")
-    lupa.wait_for(state="visible", timeout=MODAL_TIMEOUT)
+    try:
+        lupa.wait_for(state="visible", timeout=LUPA_VISIBLE_TIMEOUT)
+    except Exception:
+        raise VoucherSearchTimeout(
+            f"Insert Invoice no abrió en {LUPA_VISIBLE_TIMEOUT // 1000}s — servidor lento"
+        )
     lupa.click()
     log.info("    Select Vouchers: abriendo modal (lupa)...")
 
