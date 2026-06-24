@@ -144,18 +144,22 @@ def confirm_bulk_transaction(page: Page) -> None:
     # No esperar aquí: el wait real es lupa.wait_for() dentro de add_vouchers_via_search.
     # El wait original (VOUCHER_INPUT) matcheaba el Create Transaction form mismo —
     # era instantáneo pero falso. "Search for Voucher" no aparece a tiempo desde acá.
-    page.wait_for_timeout(500)
+    page.wait_for_timeout(800)
     # Detectar error de TourplanNX tras el OK (ej. 1038 Reference Exists).
-    # Usar get_by_role("dialog") — solo dialogs abiertos en el a11y tree.
-    # page.locator("tp-dialog") ve TODOS los elementos del pool de Angular (incluso
-    # los cerrados que conservan texto de errores anteriores) → falsos positivos.
+    # - get_by_role("dialog"): solo dialogs abiertos en el a11y tree (descarta pool cerrado).
+    # - text_content(): lee todo el DOM, inner_text() puede devolver vacío si Angular
+    #   aún no terminó de renderizar el contenido visible.
+    # - Requiere "Transaction error" en el texto: evita falsos positivos de dialogs
+    #   del pool que tienen "Error!" en el DOM sin contenido de error real.
     error_dialog = page.get_by_role("dialog").filter(has_text="Error!")
     if error_dialog.count() > 0:
-        error_text = (error_dialog.last.inner_text() or "").strip()
-        if not error_text:
-            # Pool dialog sin contenido visible — ignorar
-            log.debug("  Dialog 'Error!' detectado pero sin texto — ignorando (pool Angular)")
-        else:
+        page.wait_for_timeout(400)  # dejar que Angular renderice el contenido
+        try:
+            error_text = (error_dialog.last.text_content() or "").strip()
+        except Exception:
+            error_text = ""
+        is_real_error = error_text and ("Transaction error" in error_text or "Reference Exists" in error_text)
+        if is_real_error:
             log.warning("  Error TourplanNX tras OK: %s", error_text)
             try:
                 error_dialog.last.get_by_role("button").last.click(force=True)
@@ -165,6 +169,8 @@ def confirm_bulk_transaction(page: Page) -> None:
             if "Reference Exists" in error_text:
                 raise ReferenceExistsError(f"1038 Reference Exists: {error_text}")
             raise Exception(f"TourplanNX error tras OK: {error_text}")
+        else:
+            log.debug("  Dialog 'Error!' sin código reconocible (falso positivo) — ignorando: %r", error_text[:80] if error_text else "")
     log.info("  Create Transaction confirmado (OK clickeado)")
 
 
