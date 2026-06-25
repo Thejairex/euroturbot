@@ -8,8 +8,11 @@ solo deja aplicar invoices de la moneda del cheque). El flujo, mapeado en vivo:
     CURRENCY         fill_currency() (valor predefinido, igual que invoice)
     PAYMENT DUE DATE input.tpdate-paymentduedate               → fecha del invoice
     PAYMENT TYPE     combo (input siguiente al due date) + .dropdown table tr → "EA1299"
-    OK (button.tpok) → modal "Select Invoice Lines"
-      button.tpselectall → OK (button.tpok)
+    OK (button.tpok) → modal "Select Invoice Lines" (formulario de búsqueda, tabs
+                       SELECTION / RESULTS; abre vacío con FOUND=0)
+      tab SELECTION → limpiar filtros de fecha (RETAIL PAYMENT DATE TO viene seteado
+                      al due date y acota la búsqueda a 0) → SEARCH (button.tpsearch)
+      → grilla carga los invoices → button.tpselectall → OK (button.tpok)
     pantalla "Insert Cheque" → SAVE (button.tpsave) → esperar cierre del modal
 
 Reutiliza de modules/transaction_creator.py: fill_currency, abort_transaction, y el
@@ -33,6 +36,31 @@ PAYMENT_TYPE_XPATH = "xpath=following::input[1]"
 CHEQUE_OK = "button.tpok"
 CHEQUE_SAVE = "button.tpsave"
 SELECT_ALL = "button.tpselectall"
+# El modal Select Invoice Lines es un formulario de búsqueda: hay que ejecutar SEARCH
+# para poblar la grilla antes de SELECT ALL (mismo botón que el modal Select Vouchers).
+SEARCH_BTN = "button.tpsearch"
+
+
+def _wait_for_transactions_grid(page: Page, timeout_ms: int = 15000) -> int:
+    """Espera a que la grilla de Transactions pinte filas (carga async tras navegar).
+
+    navigate_to_transactions solo espera 500ms fijos; la grilla del servidor puede
+    tardar más y se leía vacía, saltando invoices que sí existían. Polling de filas
+    tr.tpgrid; si tras el timeout no hay ninguna, se asume grilla genuinamente vacía y
+    el caller sigue (no rompe)."""
+    waited = 0
+    step = 500
+    while waited < timeout_ms:
+        try:
+            rows = page.locator("tr.tpgrid").count()
+        except Exception:
+            rows = 0
+        if rows > 0:
+            page.wait_for_timeout(step)  # settle: dejar que termine de poblar
+            return rows
+        page.wait_for_timeout(step)
+        waited += step
+    return 0
 
 
 def read_invoice_summary_by_currency(page: Page) -> dict:
@@ -43,6 +71,9 @@ def read_invoice_summary_by_currency(page: Page) -> dict:
     REMAINDER). La fecha es la del primer invoice de la moneda; si hay fechas distintas
     deja un warning.
     """
+    # Esperar a que la grilla cargue antes de leer (evita leerla vacía por timing).
+    _wait_for_transactions_grid(page)
+
     data = page.evaluate("""
         () => {
             const out = {};
@@ -144,6 +175,37 @@ def fill_cheque_header(page: Page, reference: str, currency: str, cheque_total: 
     log.info("    PAYMENT TYPE=%s", payment_type)
 
 
+def _clear_date_filters(page: Page) -> None:
+    """Limpia los filtros de fecha del formulario SELECTION de Select Invoice Lines.
+
+    Por defecto el modal trae RETAIL PAYMENT DATE TO seteado (= due date del cheque), lo
+    que acota la búsqueda y devuelve 0 invoices. Limpiando las fechas, SEARCH trae todos
+    los invoices outstanding del proveedor en la moneda. Usa el setter nativo + eventos
+    (no .fill(), que rompe el binding del datepicker Angular), sobre el último dialog."""
+    page.evaluate("""
+        () => {
+            const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
+            const modal = dialogs[dialogs.length - 1];
+            if (!modal) return;
+            const setter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value').set;
+            const sels = [
+                'input.tpdate-retailpaymentdatefrom',
+                'input.tpdate-retailpaymentdateto',
+                'input.tpdate-invoice',
+            ];
+            for (const sel of sels) {
+                modal.querySelectorAll(sel).forEach(el => {
+                    setter.call(el, '');
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                });
+            }
+        }
+    """)
+
+
 def confirm_and_select_invoices(page: Page) -> int:
     """Click OK → modal 'Select Invoice Lines' → SELECT ALL → OK. Vuelve a 'Insert Cheque'.
 
@@ -157,12 +219,49 @@ def confirm_and_select_invoices(page: Page) -> int:
     expect(ok_btn).to_be_enabled(timeout=MODAL_TIMEOUT)
     ok_btn.click()
 
-    sil = page.get_by_role("dialog").filter(has_text="Select Invoice Lines")
+    sil = page.get_by_role("dialog").filter(has_text="Select Invoice Lines").last
     sil.wait_for(state="visible", timeout=MODAL_TIMEOUT)
     log.info("    Select Invoice Lines abierto")
 
-    sil.locator(SELECT_ALL).click()
-    found = _read_found_count(page)
+    # El modal tiene tabs SELECTION / RESULTS. Abre mostrando RESULTS vacío ("No results
+    # found", FOUND=0). El botón Search vive en la tab SELECTION (formulario de criterios);
+    # con RESULTS activa, button.tpsearch existe en el DOM pero NO es visible. Hay que
+    # activar SELECTION antes de buscar.
+    try:
+        sil.get_by_text("Selection", exact=True).first.click()
+        page.wait_for_timeout(500)
+    except Exception:
+        log.debug("    Tab 'Selection' no clickeable (¿ya activa?)")
+
+    # Borrar los filtros de fecha: por defecto RETAIL PAYMENT DATE TO acota la búsqueda
+    # y devuelve 0 invoices. Sin fechas, SEARCH trae todos los outstanding del proveedor.
+    _clear_date_filters(page)
+    page.wait_for_timeout(300)
+    log.info("    Filtros de fecha limpiados")
+
+    # Ejecutar SEARCH para que el servidor traiga los invoices (sin esto la grilla queda
+    # vacía y SELECT ALL/OK deshabilitados). Análogo al SEARCH del modal Select Vouchers.
+    search_btn = sil.locator(SEARCH_BTN)
+    search_btn.wait_for(state="visible", timeout=MODAL_TIMEOUT)
+    search_btn.click()
+    log.info("    SEARCH ejecutado en Select Invoice Lines")
+
+    # Tras SEARCH la grilla se puebla async; esperar a que cargue (contador 'Found' o
+    # filas) antes de SELECT ALL, sin wait fijo (racy).
+    select_all_btn = sil.locator(SELECT_ALL)
+    loaded = _wait_for_invoices_loaded(page)
+    log.info("    Grilla cargada: Found=%s", loaded)
+
+    if loaded <= 0:
+        # El modal abrió pero la grilla no trajo invoices tras esperar (SELECT ALL queda
+        # disabled). Se captura el DOM del modal para diagnosticar y se aborta limpio:
+        # clickear el botón deshabilitado solo agrega un timeout de 30s y una excepción.
+        _dump_modal_state(page, "cheque_select_invoice_lines_vacio")
+        return 0
+
+    expect(select_all_btn).to_be_enabled(timeout=MODAL_TIMEOUT)
+    select_all_btn.click()
+    found = _read_found_count(page) or loaded
     sil_ok = sil.get_by_role("button", name="OK")
     expect(sil_ok).to_be_enabled(timeout=MODAL_TIMEOUT)
     log.info("    SELECT ALL: %s invoices (FOUND)", found)
@@ -183,6 +282,62 @@ def _read_found_count(page: Page) -> int:
             return m ? parseInt(m[1].replace(/,/g, ''), 10) : 0;
         }
     """) or 0
+
+
+def _wait_for_invoices_loaded(page: Page, timeout_ms: int = 35000) -> int:
+    """Espera a que Select Invoice Lines termine de cargar los invoices del servidor.
+
+    El modal abre antes de que el servidor responda, así que se hace polling (no wait
+    fijo, que es racy). Señal de carga: el contador 'Found' > 0, o filas en la grilla
+    del modal. Espejo de _wait_for_search_results del pipeline de invoices (que también
+    espera el 'Found' en vez del spinner, que se cuelga). Devuelve el conteo (0 si no
+    apareció ninguna señal dentro del timeout — el caller igual sigue, no asume vacío)."""
+    waited = 0
+    step = 500
+    while waited < timeout_ms:
+        found = _read_found_count(page)
+        if found and found > 0:
+            return found
+        try:
+            rows = page.locator("dialog[open] tr.tpgrid").count()
+        except Exception:
+            rows = 0
+        if rows > 0:
+            # La grilla ya pintó filas; dar un instante a que el contador 'Found' actualice.
+            page.wait_for_timeout(step)
+            return _read_found_count(page) or rows
+        page.wait_for_timeout(step)
+        waited += step
+    return _read_found_count(page) or 0
+
+
+def _dump_modal_state(page: Page, name: str) -> None:
+    """Captura screenshot + HTML del último dialog abierto para diagnosticar fallas.
+
+    Se usa cuando la grilla queda vacía (FOUND=0): deja en outputs/screenshots/ una
+    foto y un recorte del DOM del modal, para entender qué devolvió el servidor sin
+    tener que reproducir el flujo en producción a mano."""
+    from config.settings import SCREENSHOT_DIR
+    try:
+        SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(SCREENSHOT_DIR / f"{name}.png"))
+        info = page.evaluate(
+            "() => {"
+            " const d = Array.from(document.querySelectorAll('dialog[open]'));"
+            " const m = d.length ? d[d.length - 1] : null;"
+            " if (!m) return {buttons: [], inputs: []};"
+            " const buttons = Array.from(m.querySelectorAll('button')).map(b => ({"
+            "   cls: b.className, txt: (b.textContent || '').trim().slice(0, 30),"
+            "   disabled: b.disabled}));"
+            " const inputs = Array.from(m.querySelectorAll('input')).map(i => ({"
+            "   cls: i.className, ph: i.placeholder || '', val: i.value || ''}));"
+            " return {buttons, inputs};"
+            "}"
+        )
+        log.warning("    [diag] Modal '%s' botones: %s", name, info.get("buttons"))
+        log.warning("    [diag] Modal '%s' inputs: %s", name, info.get("inputs"))
+    except Exception as e:
+        log.debug("    [diag] No se pudo capturar el estado del modal: %s", e)
 
 
 def save_cheque(page: Page) -> None:

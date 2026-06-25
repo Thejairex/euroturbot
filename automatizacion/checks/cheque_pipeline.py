@@ -100,10 +100,18 @@ def run_cheque_pipeline(page, stats, tracker: ProcessTracker | None = None,
                 due = summary[currency]["date"]
                 total = summary[currency]["total"]
                 try:
-                    create_cheque(page, supplier_code, currency, reference, total, due,
-                                  CHEQUE_PAYMENT_TYPE)
+                    found = create_cheque(page, supplier_code, currency, reference, total, due,
+                                          CHEQUE_PAYMENT_TYPE)
                     if tracker:
-                        tracker.mark_cheque_ok(supplier_code, currency, reference, due)
+                        if found and found > 0:
+                            tracker.mark_cheque_ok(supplier_code, currency, reference, due)
+                        else:
+                            # create_cheque devolvió 0 (modal sin invoices, abortado): NO es
+                            # éxito — marcarlo failed para que no quede falsamente 'ok' y la
+                            # idempotencia lo reintente.
+                            tracker.mark_cheque_failed(
+                                supplier_code, currency, reference,
+                                "Select Invoice Lines sin invoices (FOUND=0)", due)
                 except Exception as e:
                     log.error("  Cheque %s/%s FAILED: %s", supplier_code, currency, e)
                     if tracker:

@@ -129,6 +129,9 @@
         </tbody>
       </table>
     </div>
+    <div class="vouchers-footer">
+      <button id="btnLoadMoreHistory" class="btn btn-small btn-secondary" style="display:none">⬇ Cargar más históricos</button>
+    </div>
   </section>
 
   <section class="skipped-section" id="skippedSection" style="display:none">
@@ -757,16 +760,51 @@ $('btnLoadLogs').addEventListener('click', function() {
     .catch(() => {});
 });
 
-async function loadHistory() {
+const HISTORY_PAGE = 100;
+let historyOffset = 0;
+let historyHasMore = true;
+let historyLoading = false;
+
+function updateLoadMoreBtn() {
+  const btn = $('btnLoadMoreHistory');
+  if (!btn) return;
+  if (historyHasMore && !historyLoading) {
+    btn.style.display = '';
+    btn.disabled = false;
+    btn.textContent = '⬇ Cargar más históricos';
+  } else if (historyLoading) {
+    btn.style.display = '';
+    btn.disabled = true;
+    btn.textContent = '⏳ Cargando...';
+  } else {
+    btn.style.display = 'none';
+  }
+}
+
+// Carga una página de históricos desde la DB. reset=true reinicia desde el principio.
+async function loadHistory(reset) {
+  if (historyLoading) return;
+  if (reset) { historyOffset = 0; historyHasMore = true; }
+  if (!historyHasMore) return;
+  historyLoading = true;
+  updateLoadMoreBtn();
   try {
-    const res = await fetch('/api/history');
+    const res = await fetch(`/api/history?limit=${HISTORY_PAGE}&offset=${historyOffset}`);
     const data = await res.json();
-    if (data.total) totalHistoryVouchers = data.total;
+    if (data.total != null) totalHistoryVouchers = data.total;
     if (data.vouchers && data.vouchers.length > 0) {
       appendHistoryVouchers(data.vouchers);
+      historyOffset += data.vouchers.length;
     }
-  } catch (e) {}
+    historyHasMore = !!data.has_more;
+  } catch (e) {
+  } finally {
+    historyLoading = false;
+    updateLoadMoreBtn();
+  }
 }
+
+$('btnLoadMoreHistory').addEventListener('click', () => loadHistory(false));
 
 // ── Reporte de proveedores ────────────────────────────────────────────────────
 let reportData = [];

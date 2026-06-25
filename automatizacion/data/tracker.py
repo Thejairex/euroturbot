@@ -97,6 +97,7 @@ class ProcessTracker:
             )
             """,
             "CREATE INDEX IF NOT EXISTS idx_rows_status ON processed_rows(filename, status)",
+            "CREATE INDEX IF NOT EXISTS idx_rows_processed_at ON processed_rows(processed_at)",
             """
             CREATE TABLE IF NOT EXISTS processed_cheques (
                 supplier_code TEXT NOT NULL,

@@ -483,6 +483,9 @@ def add_vouchers_via_search(
     # 2. Esperar el modal Select Vouchers
     sv = page.get_by_role("dialog").filter(has_text="Select Vouchers")
     sv.wait_for(state="visible", timeout=MODAL_TIMEOUT)
+    # Pausa entre modales: la transición rápida entre ventanas no alcanzaba a montar
+    # el modal antes de interactuar. 1s le da tiempo a que cargue.
+    page.wait_for_timeout(1000)
 
     # 3. Setear rango VOUCHER FROM/TO para acotar la búsqueda en el servidor
     if voucher_from or voucher_to:
@@ -491,6 +494,8 @@ def add_vouchers_via_search(
     # 4. Click SEARCH (button.tpsearch — evita ambigüedad con "Search for Supplier")
     sv.locator("button.tpsearch").click()
     log.info("    SEARCH ejecutado (FROM=%s TO=%s)...", voucher_from, voucher_to)
+    # Pausa para que la consulta del servidor traiga los resultados antes de leerlos/seleccionarlos.
+    page.wait_for_timeout(1000)
 
     # 5. Esperar el resultado por el contador 'Found' (NO el spinner, que se cuelga).
     #    _wait_for_search_results lanza VoucherSearchTimeout si hay Error! 1026.

@@ -191,13 +191,20 @@ async def get_sheets():
 
 
 @app.get("/api/history")
-async def get_history():
-    """Devuelve todos los vouchers procesados. PostgreSQL: query directa.
-    SQLite: query directa con fallback por chunks si la DB está corrupta."""
+async def get_history(limit: int = 100, offset: int = 0):
+    """Devuelve una página de vouchers procesados desde la DB (más recientes primero).
+
+    Paginado con LIMIT/OFFSET para no cargar toda la tabla de golpe — apoyado en el
+    índice idx_rows_processed_at. El total real solo se cuenta en la primera página
+    (offset == 0) para evitar un COUNT(*) en cada scroll."""
+    limit = max(1, min(limit, 500))  # cota defensiva
+    offset = max(0, offset)
+
     def _fetch():
         conn, db_type = _get_tracker_conn()
         if conn is None:
-            return {"vouchers": [], "total": 0}
+            return {"vouchers": [], "total": 0, "offset": offset,
+                    "limit": limit, "has_more": False}
 
         def _row_to_dict(r):
             ts_raw = r["processed_at"] or ""
@@ -214,59 +221,52 @@ async def get_history():
                 "source": "history",
             }
 
-        BASE_SQL = (
+        PAGE_SQL = (
             "SELECT filename, row_index, booking_reference, supplier_code, currency, "
             "status, error, processed_at "
             "FROM processed_rows "
             "WHERE status IN ('ok', 'failed', 'skipped') "
-            "ORDER BY processed_at DESC"
+            "ORDER BY processed_at DESC "
+            "LIMIT %s OFFSET %s"
+        )
+        COUNT_SQL = (
+            "SELECT COUNT(*) AS cnt FROM processed_rows "
+            "WHERE status IN ('ok', 'failed', 'skipped')"
         )
 
         try:
             if db_type == "pgsql":
                 cur = conn.cursor()
-                cur.execute(BASE_SQL)
+                cur.execute(PAGE_SQL, (limit, offset))
                 rows = cur.fetchall()
-                conn.close()
-                return {"vouchers": [_row_to_dict(r) for r in rows], "total": len(rows)}
-
-            # SQLite: query directa primero
-            try:
-                rows = conn.execute(BASE_SQL).fetchall()
-                conn.close()
-                return {"vouchers": [_row_to_dict(r) for r in rows], "total": len(rows)}
-            except Exception:
-                pass
-
-            # SQLite fallback: chunks para DB parcialmente corrupta
-            result = []
-            CHUNK = 5000
-            offset = 0
-            while True:
-                try:
-                    chunk = conn.execute(
-                        "SELECT filename, row_index, booking_reference, supplier_code, currency, "
-                        "status, error, processed_at "
-                        "FROM processed_rows "
-                        "WHERE status IN ('ok', 'failed', 'skipped') "
-                        "LIMIT ? OFFSET ?",
-                        (CHUNK, offset),
-                    ).fetchall()
-                except Exception:
-                    break
-                if not chunk:
-                    break
-                result.extend(_row_to_dict(r) for r in chunk)
-                offset += CHUNK
+                total = None
+                if offset == 0:
+                    cur.execute(COUNT_SQL)
+                    total = cur.fetchone()["cnt"]
+            else:
+                sql = PAGE_SQL.replace("%s", "?")
+                rows = conn.execute(sql, (limit, offset)).fetchall()
+                total = None
+                if offset == 0:
+                    total = conn.execute(COUNT_SQL).fetchone()["cnt"]
             conn.close()
-            return {"vouchers": result, "total": len(result)}
+
+            vouchers = [_row_to_dict(r) for r in rows]
+            return {
+                "vouchers": vouchers,
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "has_more": len(vouchers) == limit,
+            }
 
         except Exception as e:
             try:
                 conn.close()
             except Exception:
                 pass
-            return {"vouchers": [], "total": 0, "error": str(e)}
+            return {"vouchers": [], "total": 0, "offset": offset,
+                    "limit": limit, "has_more": False, "error": str(e)}
 
     return await run_in_threadpool(_fetch)
 
