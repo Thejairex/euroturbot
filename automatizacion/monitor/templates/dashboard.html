@@ -20,6 +20,7 @@
   <section class="controls">
     <button id="btnStart" class="btn btn-primary">▶ Iniciar todo</button>
     <button id="btnStartPipeline" class="btn btn-success">📁 Solo archivos</button>
+    <button id="btnStartCheques" class="btn btn-success">🧾 Cheques</button>
     <button id="btnStop" class="btn btn-danger" disabled>⏹ Detener</button>
     <button id="btnForceStop" class="btn btn-force" disabled>⛔ Forzar detención</button>
     <button id="btnRefresh" class="btn btn-secondary">🔄 Refrescar</button>
@@ -231,6 +232,7 @@ const pendingBadge = $('pendingBadge');
 const eventFeed = $('eventFeed');
 const btnStart = $('btnStart');
 const btnPipeline = $('btnStartPipeline');
+const btnCheques = $('btnStartCheques');
 const btnStop = $('btnStop');
 const btnForceStop = $('btnForceStop');
 const btnRefresh = $('btnRefresh');
@@ -286,6 +288,7 @@ function setControlsFromState(state) {
   const busy = ['running', 'stopping', 'hung'].includes(state);
   btnStart.disabled = busy;
   btnPipeline.disabled = busy;
+  btnCheques.disabled = busy;
   chkTest.disabled = busy;
   chkVisible.disabled = busy;
   chkNoTracker.disabled = busy;
@@ -663,6 +666,25 @@ btnPipeline.addEventListener('click', function() {
     })
     .catch(() => {
       btn.textContent = '📁 Solo archivos';
+      setControlsFromState(prevState);
+    });
+});
+
+btnCheques.addEventListener('click', function() {
+  const btn = this;
+  btn.disabled = true;
+  btn.textContent = '⏳ Iniciando...';
+  fetch('/api/start/cheques' + getStartQuery(), { method: 'POST' })
+    .then(r => r.json())
+    .then(data => {
+      btn.textContent = '🧾 Cheques';
+      if (data.status !== 'ok') {
+        alert(data.message);
+        setControlsFromState(prevState);
+      }
+    })
+    .catch(() => {
+      btn.textContent = '🧾 Cheques';
       setControlsFromState(prevState);
     });
 });

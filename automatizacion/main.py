@@ -199,6 +199,70 @@ def run_pipeline_only(
     _finish(browser, stats)
 
 
+def run_cheques_only(
+    stats: StatsTracker,
+    headless: bool = False,
+    test_config: dict | None = None,
+    no_tracker: bool = False,
+    use_session: bool = True,
+    _browser: BrowserManager | None = None,
+    _stop_event: Event | None = None,
+):
+    """Igual que run_pipeline_only pero ejecuta el pipeline de CHEQUES (módulo checks).
+
+    Emite un cheque (orden de pago) por proveedor+moneda a partir de los invoices ya
+    cargados. Comparte el preámbulo de browser/sesión/login y el cierre (_finish).
+    """
+    from checks.cheque_pipeline import run_cheque_pipeline
+
+    stats.start_run()
+    browser = _browser if _browser is not None else BrowserManager(headless=headless)
+    stop_event = _stop_event if _stop_event is not None else _make_stop()
+    tracker = ProcessTracker() if not no_tracker else None
+    store = SessionStore()
+
+    try:
+        log.info("Iniciando pipeline de cheques (headless=%s)", headless)
+
+        if use_session and store.exists():
+            log.info("Restaurando sesión guardada...")
+            page = browser.start(storage_state=store.state_path(), init_script=store.init_script())
+        else:
+            page = browser.start()
+
+        log.info("Navegando a creditor...")
+        page.goto(spa_url("creditor"))
+        page.wait_for_load_state("networkidle")
+
+        if not is_logged_in(page):
+            log.info("Sesión expirada o no existe — haciendo login...")
+            do_login(page, stats)
+            page.goto(spa_url("creditor"))
+            page.wait_for_load_state("networkidle")
+        else:
+            log.info("Sesión activa — sin re-login.")
+
+        if use_session:
+            browser.save_session(store)
+            log.info("Sesión guardada en disco.")
+
+        run_cheque_pipeline(page, stats, tracker, stop_event=stop_event, test_config=test_config)
+
+        log.info("Pipeline de cheques completado. Progreso: %s%%", stats.progress)
+
+    except KeyboardInterrupt:
+        log.info("Interrupción por teclado")
+        _finish(browser, stats, "Interrumpido por el usuario")
+        return
+
+    except Exception as e:
+        log.error("Error fatal: %s", e)
+        _finish(browser, stats, str(e))
+        return
+
+    _finish(browser, stats)
+
+
 class RunManager:
     """Dueño del ciclo de vida de cada run: thread, stats, browser y stop_event."""
 
@@ -233,7 +297,12 @@ class RunManager:
             stats = StatsTracker()
             browser = BrowserManager(headless=headless)
 
-            target = run_automation if mode == "full" else run_pipeline_only
+            if mode == "full":
+                target = run_automation
+            elif mode == "cheques":
+                target = run_cheques_only
+            else:
+                target = run_pipeline_only
             t = threading.Thread(
                 target=target,
                 kwargs={
@@ -255,7 +324,8 @@ class RunManager:
 
             t.start()
             log.info("RunManager: run '%s' iniciado (headless=%s)", mode, headless)
-            return True, f"{'Automatización' if mode == 'full' else 'Pipeline'} iniciado"
+            label = {"full": "Automatización", "cheques": "Cheques"}.get(mode, "Pipeline")
+            return True, f"{label} iniciado"
 
     def stop(self) -> tuple[bool, str]:
         with self._lock:

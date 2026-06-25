@@ -97,6 +97,18 @@ class ProcessTracker:
             )
             """,
             "CREATE INDEX IF NOT EXISTS idx_rows_status ON processed_rows(filename, status)",
+            """
+            CREATE TABLE IF NOT EXISTS processed_cheques (
+                supplier_code TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                reference TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                payment_due_date TEXT,
+                error TEXT,
+                created_at TEXT,
+                PRIMARY KEY (supplier_code, currency)
+            )
+            """,
         ]
 
         if self._db_type == "pgsql":
@@ -400,6 +412,91 @@ class ProcessTracker:
         )
         return dict(row) if row else None
 
+    def get_rows_by_status(
+        self, status: str, filename: str | None = None
+    ) -> list[dict]:
+        """Devuelve las filas con un estatus dado (ok/failed/skipped/pending/processing).
+
+        Si filename es None, busca en todos los archivos. Read-only: no muta estado.
+        """
+        if filename is None:
+            rows = self._fetchall(
+                "SELECT * FROM processed_rows WHERE status = %s "
+                "ORDER BY filename, row_index",
+                (status,),
+            )
+        else:
+            rows = self._fetchall(
+                "SELECT * FROM processed_rows WHERE filename = %s AND status = %s "
+                "ORDER BY row_index",
+                (filename, status),
+            )
+        return [dict(r) for r in rows]
+
+    def count_rows_by_status(self, status: str, filename: str | None = None) -> int:
+        """Cuenta las filas con un estatus dado (opcionalmente acotado a un archivo)."""
+        if filename is None:
+            row = self._fetchone(
+                "SELECT COUNT(*) AS cnt FROM processed_rows WHERE status = %s",
+                (status,),
+            )
+        else:
+            row = self._fetchone(
+                "SELECT COUNT(*) AS cnt FROM processed_rows "
+                "WHERE filename = %s AND status = %s",
+                (filename, status),
+            )
+        return row["cnt"] if row else 0
+
+    # ── Tracking de cheques (orden de pago) ───────────────────────────────────
+
+    def _upsert_cheque(self, supplier_code, currency, reference, status,
+                       payment_due_date=None, error=None):
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        if self._db_type == "pgsql":
+            self._execute(
+                "INSERT INTO processed_cheques "
+                "(supplier_code, currency, reference, status, payment_due_date, error, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (supplier_code, currency) DO UPDATE SET "
+                "reference = EXCLUDED.reference, status = EXCLUDED.status, "
+                "payment_due_date = EXCLUDED.payment_due_date, error = EXCLUDED.error, "
+                "created_at = EXCLUDED.created_at",
+                (supplier_code, currency, reference, status, payment_due_date, error, now),
+            )
+        else:
+            self._execute(
+                "INSERT OR REPLACE INTO processed_cheques "
+                "(supplier_code, currency, reference, status, payment_due_date, error, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (supplier_code, currency, reference, status, payment_due_date, error, now),
+            )
+        self._conn.commit()
+
+    def mark_cheque_ok(self, supplier_code: str, currency: str, reference: str,
+                       payment_due_date: str | None = None):
+        self._upsert_cheque(supplier_code, currency, reference, "ok", payment_due_date, None)
+
+    def mark_cheque_failed(self, supplier_code: str, currency: str, reference: str,
+                           error: str, payment_due_date: str | None = None):
+        self._upsert_cheque(supplier_code, currency, reference, "failed", payment_due_date, error)
+
+    def is_cheque_done(self, supplier_code: str, currency: str) -> bool:
+        """True si ya existe un cheque 'ok' para ese proveedor+moneda (idempotencia)."""
+        row = self._fetchone(
+            "SELECT status FROM processed_cheques "
+            "WHERE supplier_code = %s AND currency = %s",
+            (supplier_code, currency),
+        )
+        return bool(row) and row["status"] == "ok"
+
+    def get_cheques_summary(self) -> list[dict]:
+        rows = self._fetchall(
+            "SELECT supplier_code, currency, reference, status, payment_due_date, "
+            "error, created_at FROM processed_cheques ORDER BY supplier_code, currency"
+        )
+        return [dict(r) for r in rows]
+
     # ── Gestión general ───────────────────────────────────────────────────────
 
     def get_summary(self) -> list[dict]:
@@ -418,6 +515,7 @@ class ProcessTracker:
     def reset_all(self):
         self._execute("DELETE FROM processed_rows")
         self._execute("DELETE FROM processed_files")
+        self._execute("DELETE FROM processed_cheques")
         self._conn.commit()
 
     def close(self):

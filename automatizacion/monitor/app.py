@@ -129,6 +129,13 @@ async def start_pipeline(request: Request):
     return {"status": "ok" if ok else "error", "message": msg}
 
 
+@app.post("/api/start/cheques")
+async def start_cheques(request: Request):
+    opts = _build_run_options(request)
+    ok, msg = run_manager.start("cheques", **opts)
+    return {"status": "ok" if ok else "error", "message": msg}
+
+
 @app.post("/api/stop")
 async def stop_automation_endpoint(force: bool = False):
     if force:

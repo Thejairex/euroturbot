@@ -48,6 +48,12 @@ VOUCHER_CHUNK_SIZE = 200
 # 200k deja margen para zonas con vouchers dispersos.
 VOUCHER_MAX_RANGE_WIDTH = 200_000
 
+# ── Cheques (orden de pago) ─────────────────────────────────────────────────────
+# Prefijo de la REFERENCE del cheque (análogo a "INV" del invoice): OP{row_index}{code}.
+CHEQUE_REFERENCE_PREFIX = "OP"
+# PAYMENT TYPE del cheque: EA1299 = "EA - CONTROL PAGOS" (mismo para ARS y USD).
+CHEQUE_PAYMENT_TYPE = "EA1299"
+
 # ── Base de datos ─────────────────────────────────────────────────────────────
 # DB_CONNECTION=pgsql  →  PostgreSQL vía psycopg2
 # DB_CONNECTION=sqlite (default)  →  SQLite local en outputs/tracker.db
