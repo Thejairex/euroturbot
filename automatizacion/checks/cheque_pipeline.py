@@ -38,11 +38,14 @@ def _plan_from_tracker(tracker: ProcessTracker) -> dict:
 
 
 def run_cheque_pipeline(page, stats, tracker: ProcessTracker | None = None,
-                        test_config: dict | None = None) -> None:
+                        stop_event=None, test_config: dict | None = None) -> None:
     """Recorre proveedores con vouchers ok y emite un cheque por moneda.
 
     En modo test (`--supplier`/`--suppliers`) sin datos en el tracker, descubre las
     monedas leyendo la grilla de Transactions; la REFERENCE usa row_index=0.
+
+    Si se pasa `stop_event`, se chequea entre proveedores (stop cooperativo): no
+    interrumpe el cheque en curso, corta el loop limpio en la siguiente iteración.
     """
     test_config = test_config or {}
     supplier_filter = test_config.get("supplier")
@@ -67,6 +70,9 @@ def run_cheque_pipeline(page, stats, tracker: ProcessTracker | None = None,
     log.info("Cheques a procesar: %d proveedor(es)", len(plan))
 
     for supplier_code, currency_rows in plan.items():
+        if stop_event is not None and stop_event.is_set():
+            log.info("Detenido por usuario — corte entre proveedores")
+            break
         stats.set_activity(supplier=supplier_code)
         try:
             open_supplier(page, supplier_code)
