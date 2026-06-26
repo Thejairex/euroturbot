@@ -810,28 +810,48 @@ def run_pipeline(
             break
 
         filename = filepath.name
-        if test_config and test_config.get("sheet"):
-            sheet_name = test_config["sheet"]
-        else:
-            sheets = get_sheet_names(filepath)
-            sheet_name = sheets[0] if sheets else None
-        if not sheet_name:
-            log.warning("  Sin hojas en %s, moviendo a processed/", filename)
-            shutil.move(str(filepath), str(PROCESSED_DIR / filename))
-            continue
-        log.info("Procesando archivo: %s (hoja: %s)", filename, sheet_name)
-        stats.set_activity(file=filename, sheet=sheet_name)
 
-        rows = get_data_rows(filepath, sheet_name)
-        if not rows:
-            log.warning("  Sin datos en %s, moviendo a processed/", sheet_name)
-            shutil.move(str(filepath), str(PROCESSED_DIR / filename))
-            continue
+        # ── Fuente de las filas: base o Excel ──────────────────────────────────────
+        # Si el archivo ya está cargado en el tracker y su hash coincide (mismo .xlsx
+        # sin cambios), se reconstruyen las filas desde la base y se evita re-parsear el
+        # Excel. Si cambió o es nuevo, se lee el Excel. get_all_records devuelve None para
+        # filas pre-migración (sin product_cost) → fallback a Excel para no perder montos.
+        rows = None
+        reused_from_db = False
+        if tracker:
+            fstatus = tracker.get_file_status(filename)
+            if fstatus and fstatus.get("file_hash") == tracker.file_hash(filepath):
+                db_rows = tracker.get_all_records(filename)
+                if db_rows:
+                    rows = db_rows
+                    reused_from_db = True
+                    log.info("Procesando archivo: %s (%d filas desde la base, sin releer Excel)",
+                             filename, len(rows))
+                    stats.set_activity(file=filename)
+
+        if rows is None:
+            if test_config and test_config.get("sheet"):
+                sheet_name = test_config["sheet"]
+            else:
+                sheets = get_sheet_names(filepath)
+                sheet_name = sheets[0] if sheets else None
+            if not sheet_name:
+                log.warning("  Sin hojas en %s, moviendo a processed/", filename)
+                shutil.move(str(filepath), str(PROCESSED_DIR / filename))
+                continue
+            log.info("Procesando archivo: %s (hoja: %s)", filename, sheet_name)
+            stats.set_activity(file=filename, sheet=sheet_name)
+            rows = get_data_rows(filepath, sheet_name)
+            if not rows:
+                log.warning("  Sin datos en %s, moviendo a processed/", filename)
+                shutil.move(str(filepath), str(PROCESSED_DIR / filename))
+                continue
 
         if tracker:
-            file_hash = tracker.file_hash(filepath)
-            tracker.mark_file_pending(filename, file_hash, len(rows))
-            tracker.init_rows(filename, rows)
+            if not reused_from_db:
+                file_hash = tracker.file_hash(filepath)
+                tracker.mark_file_pending(filename, file_hash, len(rows))
+                tracker.init_rows(filename, rows)
             tracker.mark_file_processing(filename)
             # Recuperar grupos interrumpidos por una caída previa (processing → pending)
             recovered = tracker.reset_processing_to_pending(filename)

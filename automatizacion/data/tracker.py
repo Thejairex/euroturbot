@@ -154,7 +154,8 @@ class ProcessTracker:
                 for r in self._conn.execute("PRAGMA table_info(processed_rows)")
             }
 
-        for col in ("supplier_code", "currency", "transaction_reference"):
+        for col in ("supplier_code", "currency", "transaction_reference",
+                    "product_cost", "supplier_name"):
             if col not in existing:
                 self._execute(f"ALTER TABLE processed_rows ADD COLUMN {col} TEXT")
 
@@ -259,6 +260,10 @@ class ProcessTracker:
                 "pending",
                 None,
                 now,
+                # product_cost y supplier_name: se guardan para poder reconstruir las
+                # filas desde la base sin releer el Excel en corridas siguientes.
+                str(r.get("ProductCost") or "").strip(),
+                (r.get("Supplier_Name") or "").strip(),
             )
             for i, r in enumerate(rows)
         ]
@@ -266,8 +271,8 @@ class ProcessTracker:
             self._executemany(
                 "INSERT INTO processed_rows "
                 "(filename, row_index, booking_reference, supplier_code, currency, "
-                "status, error, processed_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "status, error, processed_at, product_cost, supplier_name) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT (filename, row_index) DO NOTHING",
                 data,
             )
@@ -275,8 +280,8 @@ class ProcessTracker:
             self._executemany(
                 "INSERT OR IGNORE INTO processed_rows "
                 "(filename, row_index, booking_reference, supplier_code, currency, "
-                "status, error, processed_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                "status, error, processed_at, product_cost, supplier_name) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 data,
             )
         self._conn.commit()
@@ -287,6 +292,43 @@ class ProcessTracker:
             "ORDER BY row_index",
             (filename,),
         )
+
+    def get_all_records(self, filename: str) -> list[dict] | None:
+        """Reconstruye las filas del Excel desde la base, con las claves del Excel y como
+        lista indexada por row_index (posición == row_index).
+
+        Permite saltarse el re-parseo del .xlsx cuando el archivo ya está cargado y sin
+        cambios. Devuelve:
+          - lista de dicts si hay filas reconstruibles,
+          - None si las filas son pre-migración (product_cost nunca se guardó) → el caller
+            debe releer el Excel para no cargar invoices con monto vacío,
+          - [] si el archivo no tiene filas en la base.
+        """
+        rows = self._fetchall(
+            "SELECT row_index, booking_reference, supplier_code, currency, "
+            "product_cost, supplier_name FROM processed_rows "
+            "WHERE filename = %s ORDER BY row_index",
+            (filename,),
+        )
+        if not rows:
+            return []
+        if all(r["product_cost"] is None for r in rows):
+            return None
+        max_idx = max(r["row_index"] for r in rows)
+        result: list[dict] = [
+            {"Supplier_Code": "", "Supplier_Name": "", "Voucher_Number": "",
+             "Service_Cost_Currency": "", "ProductCost": ""}
+            for _ in range(max_idx + 1)
+        ]
+        for r in rows:
+            result[r["row_index"]] = {
+                "Supplier_Code": r["supplier_code"] or "",
+                "Supplier_Name": r["supplier_name"] or "",
+                "Voucher_Number": r["booking_reference"] or "",
+                "Service_Cost_Currency": r["currency"] or "",
+                "ProductCost": r["product_cost"] or "",
+            }
+        return result
 
     def mark_row_processing(self, filename: str, row_index: int):
         self._execute(

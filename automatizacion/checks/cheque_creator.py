@@ -10,14 +10,17 @@ solo deja aplicar invoices de la moneda del cheque). El flujo, mapeado en vivo:
     PAYMENT TYPE     combo (input siguiente al due date) + .dropdown table tr → "EA1299"
     OK (button.tpok) → modal "Select Invoice Lines" (formulario de búsqueda, tabs
                        SELECTION / RESULTS; abre vacío con FOUND=0)
-      tab SELECTION → limpiar filtros de fecha (RETAIL PAYMENT DATE TO viene seteado
-                      al due date y acota la búsqueda a 0) → SEARCH (button.tpsearch)
+      tab SELECTION → PAYMENT DATE TO (input.tpdate-retailpaymentdateto) = último día del
+                      mes siguiente a la fecha del invoice (el default viene = fecha del
+                      invoice y acota a 0) → SEARCH (button.tpsearch)
       → grilla carga los invoices → button.tpselectall → OK (button.tpok)
     pantalla "Insert Cheque" → SAVE (button.tpsave) → esperar cierre del modal
 
 Reutiliza de modules/transaction_creator.py: fill_currency, abort_transaction, y el
 patrón de SAVE (esperar cierre de modal, no el spinner colgado).
 """
+import calendar
+
 from playwright.sync_api import Page, expect
 
 from modules.transaction_creator import (
@@ -175,39 +178,121 @@ def fill_cheque_header(page: Page, reference: str, currency: str, cheque_total: 
     log.info("    PAYMENT TYPE=%s", payment_type)
 
 
-def _clear_date_filters(page: Page) -> None:
-    """Limpia los filtros de fecha del formulario SELECTION de Select Invoice Lines.
+_MESES_CAP = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
-    Por defecto el modal trae RETAIL PAYMENT DATE TO seteado (= due date del cheque), lo
-    que acota la búsqueda y devuelve 0 invoices. Limpiando las fechas, SEARCH trae todos
-    los invoices outstanding del proveedor en la moneda. Usa el setter nativo + eventos
-    (no .fill(), que rompe el binding del datepicker Angular), sobre el último dialog."""
+
+def _last_day_of_next_month(due_date_str: str) -> str | None:
+    """De una fecha 'DD/Mon/YYYY' (ej '19/Jun/2026') devuelve el último día del mes
+    SIGUIENTE en el mismo formato (ej '31/Jul/2026'). None si no parsea.
+
+    El campo PAYMENT DATE TO del modal Select Invoice Lines necesita una fecha posterior
+    a la de los invoices para traerlos; el último día del mes siguiente da margen."""
+    try:
+        parts = due_date_str.strip().split("/")
+        if len(parts) != 3:
+            return None
+        month = _MESES_CAP.index(parts[1].strip().title()) + 1  # 'Jun' -> 6
+        year = int(parts[2])
+    except (ValueError, IndexError, AttributeError):
+        return None
+    nm, ny = (1, year + 1) if month == 12 else (month + 1, year)  # rollover diciembre
+    last = calendar.monthrange(ny, nm)[1]
+    return f"{last}/{_MESES_CAP[nm - 1]}/{ny}"
+
+
+def _set_payment_date_to(page: Page, value: str) -> None:
+    """Setea el filtro PAYMENT DATE TO (input.tpdate-retailpaymentdateto) del formulario
+    SELECTION de Select Invoice Lines, en el último dialog abierto.
+
+    Por defecto ese filtro viene = PAYMENT DUE DATE del cheque (la fecha del invoice), lo
+    que acota la búsqueda y devuelve 0 invoices. Poniéndolo en el último día del mes
+    siguiente, SEARCH trae los invoices. Usa el setter nativo + eventos (no .fill(), que
+    rompe el binding del datepicker Angular). NO toca la fecha del cheque (solo el filtro)."""
     page.evaluate("""
-        () => {
+        (val) => {
             const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
             const modal = dialogs[dialogs.length - 1];
             if (!modal) return;
             const setter = Object.getOwnPropertyDescriptor(
                 window.HTMLInputElement.prototype, 'value').set;
-            const sels = [
-                'input.tpdate-retailpaymentdatefrom',
-                'input.tpdate-retailpaymentdateto',
-                'input.tpdate-invoice',
-            ];
-            for (const sel of sels) {
-                modal.querySelectorAll(sel).forEach(el => {
-                    setter.call(el, '');
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                    el.dispatchEvent(new Event('blur', { bubbles: true }));
-                });
-            }
+            modal.querySelectorAll('input.tpdate-retailpaymentdateto').forEach(el => {
+                setter.call(el, val);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new Event('blur', { bubbles: true }));
+            });
         }
-    """)
+    """, value)
 
 
-def confirm_and_select_invoices(page: Page) -> int:
+def _activate_selection_tab(page: Page, attempts: int = 4, per_attempt_ms: int = 4000) -> bool:
+    """Activa la tab SELECTION del modal Select Invoice Lines y espera a que el botón
+    SEARCH sea visible (vive en esa tab). El click de tab a veces no registra al primer
+    intento (race Angular), dejando RESULTS activa y SEARCH oculto → se reintenta. Usa
+    click nativo sobre el último dialog abierto. Devuelve True si SEARCH quedó visible."""
+    for _ in range(attempts):
+        page.evaluate(
+            "() => { const d = Array.from(document.querySelectorAll('dialog[open]')).pop();"
+            " if (!d) return;"
+            " const li = Array.from(d.querySelectorAll('li.tptablabel'))"
+            "   .find(e => (e.textContent || '').trim() === 'Selection');"
+            " if (li) li.click(); }"
+        )
+        waited = 0
+        while waited < per_attempt_ms:
+            # Visibilidad REAL (no solo bounding box): la tab inactiva usa visibility:hidden,
+            # que da rect>0 pero Playwright (y un click real) lo trata como no visible.
+            search_visible = page.evaluate(
+                "() => { const d = Array.from(document.querySelectorAll('dialog[open]')).pop();"
+                " const b = d && d.querySelector('button.tpsearch');"
+                " if (!b) return false;"
+                " const r = b.getBoundingClientRect();"
+                " const st = window.getComputedStyle(b);"
+                " return r.width > 0 && r.height > 0 && b.offsetParent !== null"
+                "        && st.visibility !== 'hidden' && st.display !== 'none'; }"
+            )
+            if search_visible:
+                return True
+            page.wait_for_timeout(300)
+            waited += 300
+    return False
+
+
+def _select_all_and_wait_ok(page: Page, attempts: int = 4, per_attempt_ms: int = 5000) -> bool:
+    """Clickea SELECT ALL y espera a que el OK del modal se habilite.
+
+    La selección a veces no registra al primer click si la grilla no terminó de asentarse
+    (OK queda disabled). Se reintenta el click (nativo, sobre el último dialog abierto —
+    el método que funciona; SELECT ALL queda disabled cuando la selección sí registró, así
+    que el re-click solo ocurre si hizo falta). Devuelve True si OK quedó habilitado."""
+    for _ in range(attempts):
+        page.evaluate(
+            "() => { const d = Array.from(document.querySelectorAll('dialog[open]')).pop();"
+            " const b = d && d.querySelector('button.tpselectall');"
+            " if (b && !b.disabled) b.click(); }"
+        )
+        waited = 0
+        while waited < per_attempt_ms:
+            ok_enabled = page.evaluate(
+                "() => { const d = Array.from(document.querySelectorAll('dialog[open]')).pop();"
+                " const ok = d && d.querySelector('button.tpok');"
+                " return ok ? !ok.disabled : false; }"
+            )
+            if ok_enabled:
+                return True
+            page.wait_for_timeout(400)
+            waited += 400
+    return False
+
+
+def confirm_and_select_invoices(page: Page, payment_due_date: str) -> int:
     """Click OK → modal 'Select Invoice Lines' → SELECT ALL → OK. Vuelve a 'Insert Cheque'.
+
+    Args:
+        payment_due_date: fecha del invoice ('DD/Mon/YYYY'). Se usa solo para calcular el
+            filtro PAYMENT DATE TO (último día del mes siguiente); NO modifica la fecha
+            del cheque.
 
     Returns:
         Cantidad de invoices (FOUND) aplicados al cheque.
@@ -225,25 +310,33 @@ def confirm_and_select_invoices(page: Page) -> int:
 
     # El modal tiene tabs SELECTION / RESULTS. Abre mostrando RESULTS vacío ("No results
     # found", FOUND=0). El botón Search vive en la tab SELECTION (formulario de criterios);
-    # con RESULTS activa, button.tpsearch existe en el DOM pero NO es visible. Hay que
-    # activar SELECTION antes de buscar.
-    try:
-        sil.get_by_text("Selection", exact=True).first.click()
-        page.wait_for_timeout(500)
-    except Exception:
-        log.debug("    Tab 'Selection' no clickeable (¿ya activa?)")
+    # con RESULTS activa, button.tpsearch existe en el DOM pero NO es visible. La activación
+    # de la tab a veces no registra al primer click (race Angular) → _activate_selection_tab
+    # reintenta hasta que SEARCH quede visible.
+    if not _activate_selection_tab(page):
+        log.warning("    No se pudo activar la tab SELECTION (SEARCH no visible) — abortando")
+        _dump_modal_state(page, "cheque_selection_tab_no_activa")
+        return 0
 
-    # Borrar los filtros de fecha: por defecto RETAIL PAYMENT DATE TO acota la búsqueda
-    # y devuelve 0 invoices. Sin fechas, SEARCH trae todos los outstanding del proveedor.
-    _clear_date_filters(page)
-    page.wait_for_timeout(300)
-    log.info("    Filtros de fecha limpiados")
+    # PAYMENT DATE TO: por defecto viene = fecha del invoice y acota la búsqueda a 0.
+    # Se setea al último día del mes siguiente para que SEARCH traiga los invoices
+    # (solo el filtro; la fecha del cheque queda intacta).
+    payment_date_to = _last_day_of_next_month(payment_due_date)
+    if payment_date_to:
+        _set_payment_date_to(page, payment_date_to)
+        page.wait_for_timeout(300)
+        log.info("    PAYMENT DATE TO (filtro) = %s", payment_date_to)
+    else:
+        log.warning("    No se pudo calcular PAYMENT DATE TO desde %r — se busca con el default",
+                    payment_due_date)
 
-    # Ejecutar SEARCH para que el servidor traiga los invoices (sin esto la grilla queda
-    # vacía y SELECT ALL/OK deshabilitados). Análogo al SEARCH del modal Select Vouchers.
-    search_btn = sil.locator(SEARCH_BTN)
-    search_btn.wait_for(state="visible", timeout=MODAL_TIMEOUT)
-    search_btn.click()
+    # Ejecutar SEARCH (click nativo sobre el último dialog abierto, consistente con la
+    # activación de la tab: evita el chequeo de visibilidad de Playwright que falla en el
+    # primer modal). Sin SEARCH la grilla queda vacía y SELECT ALL/OK deshabilitados.
+    page.evaluate(
+        "() => { const d = Array.from(document.querySelectorAll('dialog[open]')).pop();"
+        " const b = d && d.querySelector('button.tpsearch'); if (b) b.click(); }"
+    )
     log.info("    SEARCH ejecutado en Select Invoice Lines")
 
     # Tras SEARCH la grilla se puebla async; esperar a que cargue (contador 'Found' o
@@ -260,12 +353,18 @@ def confirm_and_select_invoices(page: Page) -> int:
         return 0
 
     expect(select_all_btn).to_be_enabled(timeout=MODAL_TIMEOUT)
-    select_all_btn.click()
+    # Asentar la grilla antes de seleccionar: si se clickea SELECT ALL apenas Found>0,
+    # a veces la selección no registra y OK nunca se habilita (race observado: 1GIAG1
+    # con 172 invoices alcanzaba a asentarse, 1ALT05 con menos no). _select_all_and_wait_ok
+    # reintenta hasta que OK quede habilitado.
+    page.wait_for_timeout(800)
+    if not _select_all_and_wait_ok(page):
+        log.warning("    OK no se habilitó tras SELECT ALL (selección no registró) — abortando")
+        _dump_modal_state(page, "cheque_ok_no_habilita")
+        return 0
     found = _read_found_count(page) or loaded
-    sil_ok = sil.get_by_role("button", name="OK")
-    expect(sil_ok).to_be_enabled(timeout=MODAL_TIMEOUT)
     log.info("    SELECT ALL: %s invoices (FOUND)", found)
-    sil_ok.click()
+    sil.get_by_role("button", name="OK").click()
     sil.wait_for(state="hidden", timeout=MODAL_TIMEOUT)
     page.wait_for_timeout(800)
     return found
@@ -403,7 +502,7 @@ def create_cheque(page: Page, supplier_code: str, currency: str, reference: str,
     try:
         open_cheque_form(page)
         fill_cheque_header(page, reference, currency, cheque_total, payment_due_date, payment_type)
-        found = confirm_and_select_invoices(page)
+        found = confirm_and_select_invoices(page, payment_due_date)
         if found <= 0:
             log.warning("    Cheque %s/%s sin invoices (FOUND=0) — abortando", supplier_code, currency)
             abort_transaction(page)
