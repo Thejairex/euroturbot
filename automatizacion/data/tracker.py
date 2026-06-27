@@ -56,8 +56,12 @@ class ProcessTracker:
     def _executemany(self, sql: str, data):
         if self._db_type == "sqlite":
             return self._conn.executemany(sql.replace("%s", "?"), data)
+        # PostgreSQL: psycopg2.executemany manda una sentencia por fila (un round-trip c/u),
+        # inviable para archivos grandes contra una base remota (ej. init_rows de 593k filas
+        # = ~10 min). execute_batch agrupa en lotes (page_size) → cientos de round-trips.
+        import psycopg2.extras
         cur = self._conn.cursor()
-        cur.executemany(sql, data)
+        psycopg2.extras.execute_batch(cur, sql, data, page_size=1000)
         return cur
 
     def _fetchone(self, sql: str, params=None):
@@ -293,6 +297,13 @@ class ProcessTracker:
             (filename,),
         )
 
+    def count_rows(self, filename: str) -> int:
+        """Cantidad total de filas registradas para un archivo (cualquier estado)."""
+        row = self._fetchone(
+            "SELECT COUNT(*) AS cnt FROM processed_rows WHERE filename = %s", (filename,)
+        )
+        return row["cnt"] if row else 0
+
     def get_all_records(self, filename: str) -> list[dict] | None:
         """Reconstruye las filas del Excel desde la base, con las claves del Excel y como
         lista indexada por row_index (posición == row_index).
@@ -335,6 +346,19 @@ class ProcessTracker:
             "UPDATE processed_rows SET status = 'processing' "
             "WHERE filename = %s AND row_index = %s",
             (filename, row_index),
+        )
+        self._conn.commit()
+
+    def mark_rows_processing_bulk(self, filename: str, row_indices: list[int]):
+        """Marca muchas filas como 'processing' en un solo lote. Evita el cuello de
+        marcar fila-por-fila (un UPDATE+commit por fila) contra Postgres remoto, que en
+        proveedores grandes tardaba ~100ms × N filas."""
+        if not row_indices:
+            return
+        self._executemany(
+            "UPDATE processed_rows SET status = 'processing' "
+            "WHERE filename = %s AND row_index = %s",
+            [(filename, idx) for idx in row_indices],
         )
         self._conn.commit()
 

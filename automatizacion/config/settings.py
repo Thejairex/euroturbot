@@ -38,6 +38,20 @@ MAX_RETRIES = 3
 # (Antes este umbral saltaba al proveedor; ahora habilita la carga por chunks.)
 MAX_VOUCHERS_PER_SUPPLIER = 500
 
+# Umbral DURO: proveedores con MÁS de N registros se POSPONEN (quedan 'pending' y se
+# loguean) en vez de procesarse, para que un proveedor monstruo (ej. 1ING01 con 52k
+# registros) no bloquee al resto del archivo. Se procesan después en una corrida
+# dedicada (subir/anular este umbral, o filtrar por --supplier). 0/None = sin límite.
+MAX_VOUCHERS_DEFER_THRESHOLD = 2000
+
+# Consultar GetAccountingTransactions para deduplicar facturas INV* ya creadas.
+# DESACTIVADO: para proveedores con historial grande la respuesta es enorme y el
+# JSON.parse bloquea el event loop del navegador (cuelga indefinidamente; el timeout
+# de 90s no alcanza a dispararse porque el hilo JS está ocupado parseando). NO es
+# necesario para la correctitud: el error 1038 'Reference Exists' ya se maneja por
+# factura (se marca ok y se sigue). Reactivar solo si se acota la query del lado server.
+READ_EXISTING_REFS = False
+
 # Tamaño de cada factura (bloque de vouchers) en la carga chunked de proveedores
 # grandes. El límite real lo impone el SAVE (CreateAPInvoice): 2108 líneas cuelga el
 # servidor >7min. 200 es conservador; subir tras validar cuánto aguanta el SAVE.

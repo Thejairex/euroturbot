@@ -9,6 +9,8 @@ import pandas as pd
 from config.settings import (
     BASE_DIR,
     MAX_VOUCHERS_PER_SUPPLIER,
+    MAX_VOUCHERS_DEFER_THRESHOLD,
+    READ_EXISTING_REFS,
     VOUCHER_CHUNK_SIZE,
     VOUCHER_MAX_RANGE_WIDTH,
 )
@@ -133,47 +135,72 @@ def _read_existing_references(page, supplier_code: str) -> dict[str, set[str]]:
 
     Devuelve {} si la API falla o no hay transacciones previas.
     """
+    if not READ_EXISTING_REFS:
+        # Desactivado: la consulta cuelga en proveedores con historial grande (ver
+        # settings). La dedup la cubre el manejo de 1038 'Reference Exists' por factura.
+        return {}
     try:
+        # La consulta GetAccountingTransactions (ShowTrans:'All' desde 2019) puede ser
+        # enorme para proveedores masivos (ej. 1ING01, 52k+ registros) y colgar el
+        # page.evaluate indefinidamente (no tiene timeout). Se acota con Promise.race +
+        # AbortController: si tarda > TIMEOUT, devuelve {__timeout:true} y se sigue sin
+        # dedup (el 1038 'Reference Exists' se maneja por chunk/factura igual).
         raw = page.evaluate("""
             async (code) => {
-                const resp = await fetch(
-                    '/tourplannx/tourplanservices/Services/Accounting.svc/json/GetAccountingTransactions',
-                    {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
-                        body: JSON.stringify({request: {
-                            Code: code,
-                            Ledger: 'AccountsPayable',
-                            InCurrency: null,
-                            Branch: null,
-                            OrderBy: 'TranDate',
-                            ShowTrans: 'All',
-                            DateFrom: '2019-10-01T00:00:00'
-                        }})
+                const TIMEOUT_MS = 90000;
+                const ctrl = new AbortController();
+                const timeout = new Promise((resolve) => setTimeout(
+                    () => { ctrl.abort(); resolve({__timeout: true}); }, TIMEOUT_MS));
+                const work = (async () => {
+                    let resp;
+                    try {
+                        resp = await fetch(
+                            '/tourplannx/tourplanservices/Services/Accounting.svc/json/GetAccountingTransactions',
+                            {
+                                method: 'POST',
+                                headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+                                body: JSON.stringify({request: {
+                                    Code: code,
+                                    Ledger: 'AccountsPayable',
+                                    InCurrency: null,
+                                    Branch: null,
+                                    OrderBy: 'TranDate',
+                                    ShowTrans: 'All',
+                                    DateFrom: '2019-10-01T00:00:00'
+                                }}),
+                                signal: ctrl.signal
+                            }
+                        );
+                    } catch (e) { return {__error: String(e)}; }
+                    if (!resp.ok) return {};
+                    const data = await resp.json();
+                    const lines = data.AccountingTransactionLines || [];
+                    const firstInv = lines.find(l => l.TransactionReference && l.TransactionReference.startsWith('INV'));
+                    const fieldKeys = firstInv ? Object.keys(firstInv) : [];
+                    const result = {};
+                    for (const l of lines) {
+                        if (!l.TransactionReference || !l.TransactionReference.startsWith('INV')) continue;
+                        const ref = l.TransactionReference;
+                        if (!result[ref]) result[ref] = [];
+                        const vno = l.VoucherNo || l.VoucherNumber || l.Voucher || l.VoucherRef || '';
+                        const vstr = String(vno).replace(/,/g, '').trim();
+                        if (vstr && vstr !== '0' && vstr !== 'null' && vstr !== 'undefined') {
+                            result[ref].push(vstr);
+                        }
                     }
-                );
-                if (!resp.ok) return {};
-                const data = await resp.json();
-                const lines = data.AccountingTransactionLines || [];
-                // Log claves de la primera línea INV* para detectar el campo de voucher
-                const firstInv = lines.find(l => l.TransactionReference && l.TransactionReference.startsWith('INV'));
-                const fieldKeys = firstInv ? Object.keys(firstInv) : [];
-                const result = {};
-                for (const l of lines) {
-                    if (!l.TransactionReference || !l.TransactionReference.startsWith('INV')) continue;
-                    const ref = l.TransactionReference;
-                    if (!result[ref]) result[ref] = [];
-                    // Intentar varios nombres de campo para el número de voucher
-                    const vno = l.VoucherNo || l.VoucherNumber || l.Voucher || l.VoucherRef || '';
-                    const vstr = String(vno).replace(/,/g, '').trim();
-                    if (vstr && vstr !== '0' && vstr !== 'null' && vstr !== 'undefined') {
-                        result[ref].push(vstr);
-                    }
-                }
-                return {refs: result, fieldKeys};
+                    return {refs: result, fieldKeys};
+                })();
+                return await Promise.race([work, timeout]);
             }
         """, supplier_code)
         raw = raw or {}
+        if raw.get("__timeout"):
+            log.warning("  [DEBUG] _read_existing_references: timeout (90s) para %s — proveedor con "
+                        "historial enorme; se sigue sin dedup (1038 se maneja por factura)", supplier_code)
+            return {}
+        if raw.get("__error"):
+            log.warning("  [DEBUG] _read_existing_references fetch error %s: %s", supplier_code, raw.get("__error"))
+            return {}
         field_keys = raw.get("fieldKeys", [])
         refs_raw = raw.get("refs", {})
         result: dict[str, set[str]] = {ref: set(vs) for ref, vs in refs_raw.items()}
@@ -458,6 +485,24 @@ def process_supplier_group(
     # VOUCHER_CHUNK_SIZE c/u, SELECT ALL por chunk). Antes se saltaban; ahora se cargan.
     es_masivo = bool(max_vouchers and max_vouchers > 0 and group["size"] > max_vouchers)
 
+    # Posponer proveedores monstruo: si superan el umbral duro se dejan 'pending' (sin
+    # tocar) y se registran, para procesarlos en una corrida dedicada. Evita que un
+    # proveedor enorme (ej. 1ING01, 52k registros) bloquee el resto del archivo.
+    if MAX_VOUCHERS_DEFER_THRESHOLD and group["size"] > MAX_VOUCHERS_DEFER_THRESHOLD:
+        log.warning("  Proveedor %s POSPUESTO: %d registros > umbral %d — queda 'pending' "
+                    "para una corrida dedicada",
+                    supplier_code, group["size"], MAX_VOUCHERS_DEFER_THRESHOLD)
+        if oversized_report is not None:
+            oversized_report.append({
+                "filename": filename,
+                "supplier_code": supplier_code,
+                "supplier_name": group.get("supplier_name", ""),
+                "voucher_count": group["size"],
+                "currencies": ", ".join(group.get("total_by_currency", {}).keys()),
+                "totals": "; ".join(f"{c}={t:.2f}" for c, t in group.get("total_by_currency", {}).items()),
+            })
+        return
+
     if group["size"] == 1:
         rec = records[0]
         process_row(page, rows[rec["row_index"]], rec["row_index"], filename, tracker, stats, stop_event=stop_event)
@@ -475,9 +520,8 @@ def process_supplier_group(
 
     all_indices = [rec["row_index"] for rec in records]
 
-    for idx in all_indices:
-        if tracker:
-            tracker.mark_row_processing(filename, idx)
+    if tracker:
+        tracker.mark_rows_processing_bulk(filename, all_indices)
 
     group_ok = True
     group_error = None
@@ -753,19 +797,18 @@ def process_supplier_group(
         log.warning("  Proveedor %s marcado oversized por timeout (%d filas skipped)",
                     supplier_code, len(all_indices))
     else:
-        # Marcar cada fila según su estado real (chunked y chico comparten esta lógica).
-        # Las filas sin estado (no procesadas por un error de navegación) → failed.
-        ok_n = skip_n = fail_n = 0
-        for idx in all_indices:
-            status = per_row_status.get(idx)
-            if not tracker:
-                continue
-            if status == "ok":
-                tracker.mark_row_ok(filename, idx); ok_n += 1
-            elif status == "skipped":
-                tracker.mark_row_skipped(filename, idx); skip_n += 1
-            else:
-                tracker.mark_row_failed(filename, idx, group_error or "no procesado"); fail_n += 1
+        # Marcar las filas según su estado real, EN LOTE (chunked y chico comparten esto).
+        # Antes era un loop fila-por-fila (un UPDATE+commit por fila) que contra Postgres
+        # remoto tardaba ~90s+ por proveedor grande. Las sin estado (no procesadas por un
+        # error de navegación) → failed.
+        ok_idx = [i for i in all_indices if per_row_status.get(i) == "ok"]
+        skip_idx = [i for i in all_indices if per_row_status.get(i) == "skipped"]
+        fail_idx = [i for i in all_indices if per_row_status.get(i) not in ("ok", "skipped")]
+        if tracker:
+            tracker.mark_rows_ok_bulk(filename, ok_idx)
+            tracker.mark_rows_skipped_bulk(filename, skip_idx)
+            tracker.mark_rows_failed_bulk(filename, fail_idx, group_error or "no procesado")
+        ok_n, skip_n, fail_n = len(ok_idx), len(skip_idx), len(fail_idx)
         if fail_n:
             log.warning("  Proveedor %s: %d ok, %d skipped, %d failed", supplier_code, ok_n, skip_n, fail_n)
         else:
@@ -818,9 +861,12 @@ def run_pipeline(
         # filas pre-migración (sin product_cost) → fallback a Excel para no perder montos.
         rows = None
         reused_from_db = False
+        fstatus = None
+        current_hash = None
         if tracker:
             fstatus = tracker.get_file_status(filename)
-            if fstatus and fstatus.get("file_hash") == tracker.file_hash(filepath):
+            current_hash = tracker.file_hash(filepath)
+            if fstatus and fstatus.get("file_hash") == current_hash:
                 db_rows = tracker.get_all_records(filename)
                 if db_rows:
                     rows = db_rows
@@ -849,9 +895,21 @@ def run_pipeline(
 
         if tracker:
             if not reused_from_db:
-                file_hash = tracker.file_hash(filepath)
-                tracker.mark_file_pending(filename, file_hash, len(rows))
-                tracker.init_rows(filename, rows)
+                # init_rows sobre archivos enormes contra Postgres remoto es lentísimo
+                # (593k filas ≈ 10 min). Si el archivo ya está cargado (mismo hash y la
+                # cantidad de filas coincide), se omite: las filas y sus estados ya están
+                # en el tracker. El parseo del Excel de arriba igual se necesita para los
+                # montos (que no se guardan en filas pre-migración).
+                already_loaded = (
+                    fstatus is not None
+                    and fstatus.get("file_hash") == current_hash
+                    and tracker.count_rows(filename) >= len(rows)
+                )
+                if already_loaded:
+                    log.info("  Filas ya cargadas en el tracker (%d) — se omite init_rows", len(rows))
+                else:
+                    tracker.mark_file_pending(filename, current_hash, len(rows))
+                    tracker.init_rows(filename, rows)
             tracker.mark_file_processing(filename)
             # Recuperar grupos interrumpidos por una caída previa (processing → pending)
             recovered = tracker.reset_processing_to_pending(filename)
