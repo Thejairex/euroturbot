@@ -67,6 +67,8 @@ VOUCHER_MAX_RANGE_WIDTH = 200_000
 CHEQUE_REFERENCE_PREFIX = "OP"
 # PAYMENT TYPE del cheque: EA1299 = "EA - CONTROL PAGOS" (mismo para ARS y USD).
 CHEQUE_PAYMENT_TYPE = "EA1299"
+# Proveedores exentos: sus Supplier_Code se saltean por completo (no se emite cheque).
+CHEQUE_EXEMPT_FILE = BASE_DIR / "input" / "proveedores_exentos.csv"
 
 # ── Base de datos ─────────────────────────────────────────────────────────────
 # DB_CONNECTION=pgsql  →  PostgreSQL vía psycopg2

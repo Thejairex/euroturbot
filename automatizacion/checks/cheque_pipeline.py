@@ -9,7 +9,7 @@ tracker, que no la guarda). La REFERENCE es OP{row_index_más_bajo}{supplier_cod
 
 Idempotencia: `processed_cheques` registra cada cheque; los que ya están `ok` se saltan.
 """
-from config.settings import CHEQUE_REFERENCE_PREFIX, CHEQUE_PAYMENT_TYPE
+from config.settings import CHEQUE_REFERENCE_PREFIX, CHEQUE_PAYMENT_TYPE, CHEQUE_EXEMPT_FILE
 from config.urls import spa_url
 from core.exceptions import SupplierNotFoundError
 from data.tracker import ProcessTracker
@@ -20,6 +20,15 @@ from modules.transaction_creator import abort_transaction
 from checks.cheque_creator import create_cheque, read_invoice_summary_by_currency
 from checks.voucher_filter import get_ok_vouchers
 from utils.logger import log
+
+
+def _load_exempt_suppliers() -> set[str]:
+    """Lee proveedores_exentos.csv → set de Supplier_Code (uppercase). Vacío si no existe."""
+    try:
+        text = CHEQUE_EXEMPT_FILE.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return set()
+    return {ln.strip().upper() for ln in text.splitlines() if ln.strip()}
 
 
 def _plan_from_tracker(tracker: ProcessTracker) -> dict:
@@ -62,6 +71,15 @@ def run_cheque_pipeline(page, stats, tracker: ProcessTracker | None = None,
     elif supplier_filter:
         plan = {s: c for s, c in plan.items() if s == supplier_filter}
         plan.setdefault(supplier_filter, {})
+
+    exempt = _load_exempt_suppliers()
+    if exempt:
+        skipped = [s for s in plan if s.upper() in exempt]
+        for s in skipped:
+            log.info("Proveedor %s exento — skip cheques (proveedores_exentos.csv)", s)
+            plan.pop(s)
+        if skipped:
+            log.info("Exentos salteados: %d proveedor(es)", len(skipped))
 
     if not plan:
         log.info("No hay proveedores con vouchers ok para emitir cheques")
