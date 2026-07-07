@@ -125,6 +125,61 @@ async def get_stats():
     return run_manager.snapshot()
 
 
+# Estados posibles por tabla — se listan explícitos para que la respuesta siempre
+# traiga todas las claves en 0, aunque la DB no tenga filas de ese estado todavía.
+_VOUCHER_STATUSES = ("pending", "processing", "ok", "failed", "skipped")
+_CHEQUE_STATUSES = ("pending", "ok", "failed")
+
+
+def _counts_by_status(conn, db_type, table: str, statuses: tuple) -> dict:
+    """Cuenta filas agrupadas por `status` en `table`. Devuelve un dict con todos los
+    estados esperados (0 si no hay filas) más `total`. Ante error (ej. tabla inexistente
+    en una DB fresca) devuelve todo en 0 para no romper el endpoint."""
+    counts = {s: 0 for s in statuses}
+    try:
+        if db_type == "pgsql":
+            cur = conn.cursor()
+            cur.execute(f"SELECT status, COUNT(*) AS cnt FROM {table} GROUP BY status")
+            rows = cur.fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT status, COUNT(*) AS cnt FROM {table} GROUP BY status"
+            ).fetchall()
+    except Exception:
+        return {**counts, "total": 0}
+    for r in rows:
+        st = r["status"] or "pending"
+        counts[st] = counts.get(st, 0) + r["cnt"]
+    counts["total"] = sum(counts.values())
+    return counts
+
+
+@app.get("/api/summary", dependencies=[Depends(require_read_key)])
+async def get_summary():
+    """Resumen persistente de estados leído de la base (no depende de una corrida activa):
+    conteo de vouchers (processed_rows) y cheques (processed_cheques) por estado."""
+    def _fetch():
+        conn, db_type = _get_tracker_conn()
+        if conn is None:
+            zero_v = {s: 0 for s in _VOUCHER_STATUSES}
+            zero_c = {s: 0 for s in _CHEQUE_STATUSES}
+            return {
+                "vouchers": {**zero_v, "total": 0},
+                "cheques": {**zero_c, "total": 0},
+            }
+        try:
+            vouchers = _counts_by_status(conn, db_type, "processed_rows", _VOUCHER_STATUSES)
+            cheques = _counts_by_status(conn, db_type, "processed_cheques", _CHEQUE_STATUSES)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return {"vouchers": vouchers, "cheques": cheques}
+
+    return await run_in_threadpool(_fetch)
+
+
 @app.get("/api/stream", dependencies=[Depends(require_read_key)])
 async def stream_stats(request: Request):
     async def event_generator():

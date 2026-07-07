@@ -78,7 +78,8 @@ Además, tu dominio debe estar autorizado en la lista de CORS del servidor
 
 | Endpoint | Descripción |
 |----------|-------------|
-| `GET /api/stats` | Snapshot puntual del estado actual (estado, modo, progreso, stats). |
+| `GET /api/summary` | **Estados persistentes desde la DB**: conteo de vouchers y cheques por estado. Disponible siempre, no depende de una corrida activa. |
+| `GET /api/stats` | Snapshot puntual de la corrida **en curso** (estado, modo, progreso). Vacío/`null` si no hay nada corriendo. |
 | `GET /api/stream` | **SSE**: stream en tiempo real del estado + eventos + vouchers nuevos. |
 | `GET /api/tracker` | Resumen de archivos procesados + pendientes en `input/`. |
 | `GET /api/history?limit=100&offset=0` | Vouchers procesados, paginados (más recientes primero). |
@@ -91,12 +92,51 @@ Además, tu dominio debe estar autorizado en la lista de CORS del servidor
 
 ## Ejemplos
 
-### 1. Snapshot puntual (REST)
+### 1. Estados desde la base (REST) — recomendado para monitoreo
 
 ```js
 const HOST = 'https://TU-HOST';
 const KEY = 'TU_KEY';
 
+const res = await fetch(`${HOST}/api/summary`, {
+  headers: { 'X-API-Key': KEY },
+});
+const s = await res.json();
+console.log('vouchers ok:', s.vouchers.ok, '/', s.vouchers.total);
+console.log('cheques ok :', s.cheques.ok, '/', s.cheques.total);
+```
+
+Respuesta:
+
+```jsonc
+{
+  "vouchers": {                 // tabla processed_rows
+    "pending": 314989,
+    "processing": 0,
+    "ok": 241585,
+    "failed": 24831,
+    "skipped": 12252,
+    "total": 593657
+  },
+  "cheques": {                  // tabla processed_cheques
+    "pending": 0,
+    "ok": 1825,
+    "failed": 224,
+    "total": 2049
+  }
+}
+```
+
+Siempre trae todas las claves de estado (en 0 si no hay filas). Es una consulta simple
+`GROUP BY status` a la base, así que refleja el acumulado histórico, no solo la corrida
+actual.
+
+### 2. Snapshot de la corrida en curso (REST)
+
+Útil solo mientras el pipeline está corriendo (progreso en vivo). Fuera de una corrida,
+`stats` viene en `null`.
+
+```js
 const res = await fetch(`${HOST}/api/stats`, {
   headers: { 'X-API-Key': KEY },
 });
@@ -104,7 +144,7 @@ const stats = await res.json();
 console.log(stats.state, stats.stats?.progress_pct);
 ```
 
-### 2. Tiempo real (SSE con EventSource)
+### 3. Tiempo real (SSE con EventSource)
 
 `EventSource` no permite headers, así que la key va **por query param**:
 
@@ -130,7 +170,7 @@ es.onerror = () => {
 El stream emite un mensaje cada ~0.5 s. Cada mensaje trae el estado completo más
 **solo los eventos y vouchers nuevos** (deltas) desde el tick anterior.
 
-### 3. Historial paginado (REST)
+### 4. Historial paginado (REST)
 
 ```js
 const res = await fetch(`${HOST}/api/history?limit=50&offset=0`, {
@@ -139,7 +179,7 @@ const res = await fetch(`${HOST}/api/history?limit=50&offset=0`, {
 const { vouchers, total, has_more } = await res.json();
 ```
 
-### 4. Descargar CSV (link directo)
+### 5. Descargar CSV (link directo)
 
 La key va por query param porque es una navegación, no un `fetch`:
 
@@ -147,7 +187,7 @@ La key va por query param porque es una navegación, no un `fetch`:
 https://TU-HOST/api/report/csv?api_key=TU_KEY
 ```
 
-### 5. Desde backend / servidor (curl)
+### 6. Desde backend / servidor (curl)
 
 ```bash
 curl -H "X-API-Key: TU_KEY" https://TU-HOST/api/report
