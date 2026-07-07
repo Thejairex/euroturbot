@@ -1,10 +1,12 @@
 import asyncio
+import hmac
 import json
 from collections import deque
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -17,12 +19,26 @@ from config.settings import (
     DB_DATABASE,
     DB_USERNAME,
     DB_PASSWORD,
+    MONITOR_API_KEY,
+    MONITOR_ADMIN_KEY,
+    MONITOR_CORS_ORIGINS,
 )
 from core.pipeline import INPUT_DIR
 from data.tracker import ProcessTracker
 from main import run_manager
 
 app = FastAPI(title="Monitor de Automatización")
+
+# CORS: permite que el JS de dominios autorizados (terceros) consuma la API.
+# La auth va por API key en header/query (no cookies), así que no se habilitan
+# credentials y solo se exponen métodos GET — el control (POST) nunca viaja cross-origin.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=MONITOR_CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET"],
+    allow_headers=["X-API-Key"],
+)
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -55,6 +71,46 @@ def _get_tracker_conn():
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
+# ── Autenticación por API key ───────────────────────────────────────────────────
+# El dashboard propio se sirve same-origin y sigue funcionando sin key. Los requests
+# cross-origin (páginas de terceros) o de clientes no-browser (curl) deben traer la
+# API key, por header `X-API-Key` o por query `?api_key=` (obligatorio para EventSource,
+# que no permite headers custom). `Sec-Fetch-Site` lo setea el navegador y el JS de
+# página no lo puede falsificar, así que es fiable para separar same-origin de terceros.
+_TRUSTED_FETCH_SITES = {"same-origin", "same-site"}
+
+
+def _is_same_origin(request: Request) -> bool:
+    return request.headers.get("sec-fetch-site", "") in _TRUSTED_FETCH_SITES
+
+
+def _provided_key(request: Request) -> str:
+    return request.headers.get("x-api-key") or request.query_params.get("api_key") or ""
+
+
+def _key_ok(provided: str, expected: str) -> bool:
+    return bool(expected) and hmac.compare_digest(provided, expected)
+
+
+def require_read_key(request: Request) -> None:
+    """Exige la read key a requests cross-origin. Same-origin (dashboard) pasa libre."""
+    if _is_same_origin(request):
+        return
+    if not MONITOR_API_KEY:
+        raise HTTPException(status_code=503, detail="API key no configurada en el servidor")
+    if not _key_ok(_provided_key(request), MONITOR_API_KEY):
+        raise HTTPException(status_code=401, detail="API key inválida o ausente")
+
+
+def require_admin(request: Request) -> None:
+    """Control (start/stop/reset): permitido same-origin o con MONITOR_ADMIN_KEY válida."""
+    if _is_same_origin(request):
+        return
+    if _key_ok(_provided_key(request), MONITOR_ADMIN_KEY):
+        return
+    raise HTTPException(status_code=403, detail="Operación de control no permitida")
+
+
 def _load_html() -> str:
     return (TEMPLATES_DIR / "dashboard.html").read_text(encoding="utf-8")
 
@@ -64,12 +120,12 @@ async def dashboard():
     return _load_html()
 
 
-@app.get("/api/stats")
+@app.get("/api/stats", dependencies=[Depends(require_read_key)])
 async def get_stats():
     return run_manager.snapshot()
 
 
-@app.get("/api/stream")
+@app.get("/api/stream", dependencies=[Depends(require_read_key)])
 async def stream_stats(request: Request):
     async def event_generator():
         last_seq = 0
@@ -115,28 +171,28 @@ def _build_run_options(request: Request) -> dict:
     return opts
 
 
-@app.post("/api/start")
+@app.post("/api/start", dependencies=[Depends(require_admin)])
 async def start_automation(request: Request):
     opts = _build_run_options(request)
     ok, msg = run_manager.start("full", **opts)
     return {"status": "ok" if ok else "error", "message": msg}
 
 
-@app.post("/api/start/pipeline")
+@app.post("/api/start/pipeline", dependencies=[Depends(require_admin)])
 async def start_pipeline(request: Request):
     opts = _build_run_options(request)
     ok, msg = run_manager.start("pipeline", **opts)
     return {"status": "ok" if ok else "error", "message": msg}
 
 
-@app.post("/api/start/cheques")
+@app.post("/api/start/cheques", dependencies=[Depends(require_admin)])
 async def start_cheques(request: Request):
     opts = _build_run_options(request)
     ok, msg = run_manager.start("cheques", **opts)
     return {"status": "ok" if ok else "error", "message": msg}
 
 
-@app.post("/api/stop")
+@app.post("/api/stop", dependencies=[Depends(require_admin)])
 async def stop_automation_endpoint(force: bool = False):
     if force:
         ok, msg = await run_in_threadpool(run_manager.force_stop)
@@ -145,7 +201,7 @@ async def stop_automation_endpoint(force: bool = False):
     return {"status": "ok" if ok else "error", "message": msg}
 
 
-@app.get("/api/logs")
+@app.get("/api/logs", dependencies=[Depends(require_read_key)])
 async def get_logs(lines: int = 100):
     log_path = Path(LOG_DIR) / "automation.log"
     if not log_path.exists():
@@ -159,7 +215,7 @@ async def get_logs(lines: int = 100):
     return {"logs": content}
 
 
-@app.get("/api/tracker")
+@app.get("/api/tracker", dependencies=[Depends(require_read_key)])
 async def get_tracker():
     def _fetch():
         tracker = ProcessTracker()
@@ -172,7 +228,7 @@ async def get_tracker():
     return await run_in_threadpool(_fetch)
 
 
-@app.get("/api/sheets")
+@app.get("/api/sheets", dependencies=[Depends(require_read_key)])
 async def get_sheets():
     """Devuelve las hojas de cada xlsx en input/. Solo se llama on-demand."""
     def _fetch():
@@ -190,7 +246,7 @@ async def get_sheets():
     return await run_in_threadpool(_fetch)
 
 
-@app.get("/api/history")
+@app.get("/api/history", dependencies=[Depends(require_read_key)])
 async def get_history(limit: int = 100, offset: int = 0):
     """Devuelve una página de vouchers procesados desde la DB (más recientes primero).
 
@@ -271,7 +327,7 @@ async def get_history(limit: int = 100, offset: int = 0):
     return await run_in_threadpool(_fetch)
 
 
-@app.get("/api/report")
+@app.get("/api/report", dependencies=[Depends(require_read_key)])
 async def get_report():
     """Resumen agregado por proveedor. PostgreSQL: GROUP BY directo con STRING_AGG.
     SQLite: GROUP BY con fallback por chunks si la DB está corrupta."""
@@ -383,7 +439,7 @@ async def get_report():
     return await run_in_threadpool(_fetch)
 
 
-@app.get("/api/report/csv")
+@app.get("/api/report/csv", dependencies=[Depends(require_read_key)])
 async def get_report_csv():
     """Descarga el reporte de proveedores como CSV (UTF-8 con BOM para Excel)."""
     import csv
@@ -418,7 +474,7 @@ async def get_report_csv():
     )
 
 
-@app.post("/api/tracker/reset")
+@app.post("/api/tracker/reset", dependencies=[Depends(require_admin)])
 async def reset_tracker(file: str = "", all: bool = False):
     def _reset():
         tracker = ProcessTracker()

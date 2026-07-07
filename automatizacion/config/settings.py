@@ -79,3 +79,16 @@ DB_PORT = os.getenv("DB_PORT", "5432")
 DB_DATABASE = os.getenv("DB_DATABASE", "euroturbot")
 DB_USERNAME = os.getenv("DB_USERNAME", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+
+# ── API del monitor (consumo desde páginas de terceros) ─────────────────────────
+# MONITOR_API_KEY      → clave de LECTURA que exigen los endpoints GET a requests
+#                        cross-origin (terceros). El dashboard same-origin no la pide.
+# MONITOR_ADMIN_KEY    → clave opcional para operar los POST de control desde fuera
+#                        (server-to-server). Vacía = control solo same-origin.
+# MONITOR_CORS_ORIGINS → lista separada por comas de dominios autorizados a consumir
+#                        la API por CORS. Vacía = ningún origen cross permitido.
+MONITOR_API_KEY = os.getenv("MONITOR_API_KEY", "")
+MONITOR_ADMIN_KEY = os.getenv("MONITOR_ADMIN_KEY", "")
+MONITOR_CORS_ORIGINS = [
+    o.strip() for o in os.getenv("MONITOR_CORS_ORIGINS", "").split(",") if o.strip()
+]
