@@ -1,6 +1,7 @@
 import csv
 import re
 import shutil
+from collections import defaultdict
 from pathlib import Path
 from threading import Event
 
@@ -244,8 +245,9 @@ def _cargar_chunk_factura(
     `piso` vouchers. Los chunks irrecuperables se devuelven como fallidos.
 
     Returns:
-        (ok_indices, failed_indices, skipped_indices) — filas cargadas / fallidas
-        (reintentables) / salteadas (vouchers no disponibles en la lupa, no reintentables).
+        (ok_indices, failed_indices, skipped_indices, fail_reason) — filas cargadas / fallidas
+        (reintentables) / salteadas (vouchers no disponibles, no reintentables) / motivo del
+        fallo (str específico para las failed, o None si no hubo fallo).
     """
     indices = [r["row_index"] for r in chunk_records]
     vouchers = [r["voucher"] for r in chunk_records]
@@ -270,7 +272,7 @@ def _cargar_chunk_factura(
                 pass
             if tracker and filename:
                 tracker.mark_rows_ok_bulk(filename, indices, reference=ref)
-            return (indices, [], [])
+            return (indices, [], [], None)
         result = add_vouchers_via_search(page, vouchers, vfrom, vto, select_all=select_all)
         # Mapear vouchers cargados → filas. Solo se tildaron vouchers NUESTROS (nunca
         # ajenos), así que loaded_recs es un subconjunto correcto del chunk.
@@ -287,7 +289,7 @@ def _cargar_chunk_factura(
             abort_transaction(page)
             if tracker and filename:
                 tracker.mark_rows_skipped_bulk(filename, indices)
-            return ([], [], indices)
+            return ([], [], indices, None)
 
         if notfound_idx:
             log.warning("    Chunk %s: %d/%d vouchers no en la lupa → se cargan los %d hallados, "
@@ -306,7 +308,7 @@ def _cargar_chunk_factura(
             if notfound_idx:
                 tracker.mark_rows_skipped_bulk(filename, notfound_idx)
             log.info("  [DEBUG] Tracker: %d ok, %d skipped (ref=%s)", len(loaded_idx), len(notfound_idx), ref)
-        return (loaded_idx, [], notfound_idx)
+        return (loaded_idx, [], notfound_idx, None)
     except InvoiceMismatchError as e:
         # Descuadre: el rango trajo vouchers de más/de menos. NO se guardó. Abortar y
         # marcar failed para revisión (el reporte de descuadres los recopila del log).
@@ -316,9 +318,10 @@ def _cargar_chunk_factura(
             abort_transaction(page)
         except Exception:
             pass
+        reason = f"Descuadre (no guardado): {e}"
         if tracker and filename:
-            tracker.mark_rows_failed_bulk(filename, indices, f"Descuadre (no guardado): {e}")
-        return ([], indices, [])
+            tracker.mark_rows_failed_bulk(filename, indices, reason)
+        return ([], indices, [], reason)
     except InvoiceSaveError as e:
         # TourplanNX rechazó el SAVE (ej. falta tipo de cambio CLP→ARS para la fecha). NO es
         # un bug ni un cuelgue: es dato/config del servidor. Marcar failed con el motivo real
@@ -328,9 +331,10 @@ def _cargar_chunk_factura(
             abort_transaction(page)
         except Exception:
             pass
+        reason = f"SAVE rechazado: {e}"
         if tracker and filename:
-            tracker.mark_rows_failed_bulk(filename, indices, f"SAVE rechazado: {e}")
-        return ([], indices, [])
+            tracker.mark_rows_failed_bulk(filename, indices, reason)
+        return ([], indices, [], reason)
     except VoucherSearchTimeout:
         try:
             abort_transaction(page)
@@ -339,17 +343,22 @@ def _cargar_chunk_factura(
         if len(chunk_records) <= piso:
             log.error("    Chunk mínimo (%d) sigue en timeout — marcando %d filas failed",
                       len(chunk_records), len(indices))
+            reason = "VoucherSearchTimeout en chunk mínimo"
             if tracker and filename:
-                tracker.mark_rows_failed_bulk(filename, indices, "VoucherSearchTimeout en chunk mínimo")
-            return ([], indices, [])
+                tracker.mark_rows_failed_bulk(filename, indices, reason)
+            return ([], indices, [], reason)
         mid = len(chunk_records) // 2
         log.warning("    VoucherSearchTimeout en chunk de %d (%s) — sub-dividiendo en %d + %d",
                     len(chunk_records), currency, mid, len(chunk_records) - mid)
-        ok1, f1, s1 = _cargar_chunk_factura(
+        ok1, f1, s1, r1 = _cargar_chunk_factura(
             page, supplier_code, currency, chunk_records[:mid], select_all, piso, tracker, filename)
-        ok2, f2, s2 = _cargar_chunk_factura(
+        ok2, f2, s2, r2 = _cargar_chunk_factura(
             page, supplier_code, currency, chunk_records[mid:], select_all, piso, tracker, filename)
-        return (ok1 + ok2, f1 + f2, s1 + s2)
+        # Motivo combinado de las mitades (si ambas coinciden, ese; si difieren, "mixto").
+        sub_reason = r1 if r1 == r2 else (r1 or r2)
+        if r1 and r2 and r1 != r2:
+            sub_reason = "VoucherSearchTimeout (subdividido, motivos mixtos)"
+        return (ok1 + ok2, f1 + f2, s1 + s2, sub_reason)
     except Exception as e:
         # Cualquier otro fallo del chunk (SAVE colgado, modal inesperado, etc.): abortar
         # y marcar este chunk failed sin tirar abajo los demás chunks del proveedor.
@@ -358,9 +367,10 @@ def _cargar_chunk_factura(
             abort_transaction(page)
         except Exception:
             pass
+        reason = f"Chunk error: {e}"
         if tracker and filename:
-            tracker.mark_rows_failed_bulk(filename, indices, str(e))
-        return ([], indices, [])
+            tracker.mark_rows_failed_bulk(filename, indices, reason)
+        return ([], indices, [], reason)
 
 
 _MESES = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
@@ -585,6 +595,7 @@ def process_supplier_group(
     group_error = None
     group_timeout = False
     per_row_status: dict[int, str] = {}
+    per_row_error: dict[int, str] = {}  # motivo específico por fila failed (para el tracker)
 
     try:
         open_supplier(page, supplier_code)
@@ -648,7 +659,7 @@ def process_supplier_group(
                         continue
                     log.info("    Factura %d/%d: %d vouchers (rango %s-%s)",
                              ci, len(chunks), len(chunk["records"]), chunk["vfrom"], chunk["vto"])
-                    ok_idx, failed_idx, skipped_idx = _cargar_chunk_factura(
+                    ok_idx, failed_idx, skipped_idx, fail_reason = _cargar_chunk_factura(
                         page, supplier_code, currency, chunk["records"], select_all=True,
                         tracker=tracker, filename=filename)
                     for idx in ok_idx:
@@ -668,6 +679,8 @@ def process_supplier_group(
                         })
                     for idx in failed_idx:
                         per_row_status[idx] = "failed"
+                        if fail_reason:
+                            per_row_error[idx] = fail_reason
                         group_ok = False
                         group_error = group_error or f"Chunk fallido ({currency})"
                 continue
@@ -884,7 +897,13 @@ def process_supplier_group(
         if tracker:
             tracker.mark_rows_ok_bulk(filename, ok_idx)
             tracker.mark_rows_skipped_bulk(filename, skip_idx)
-            tracker.mark_rows_failed_bulk(filename, fail_idx, group_error or "no procesado")
+            # Guardar el motivo ESPECÍFICO por fila (Descuadre / SAVE rechazado / timeout / etc.),
+            # no el genérico "Chunk fallido". Se agrupa por motivo y se marca por lotes.
+            _por_motivo: dict[str, list[int]] = defaultdict(list)
+            for i in fail_idx:
+                _por_motivo[per_row_error.get(i) or group_error or "no procesado"].append(i)
+            for _motivo, _idxs in _por_motivo.items():
+                tracker.mark_rows_failed_bulk(filename, _idxs, _motivo)
         ok_n, skip_n, fail_n = len(ok_idx), len(skip_idx), len(fail_idx)
         if fail_n:
             log.warning("  Proveedor %s: %d ok, %d skipped, %d failed", supplier_code, ok_n, skip_n, fail_n)
