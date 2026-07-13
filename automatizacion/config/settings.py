@@ -62,6 +62,29 @@ VOUCHER_CHUNK_SIZE = 200
 # 200k deja margen para zonas con vouchers dispersos.
 VOUCHER_MAX_RANGE_WIDTH = 200_000
 
+# Corte por hueco: si entre dos vouchers consecutivos (ordenados) hay un salto mayor a
+# este valor, se corta un chunk nuevo. Mantiene los rangos DENSOS (menos vouchers ajenos
+# devueltos por el SEARCH → escaneo del grid más rápido y menor riesgo de timeout SQL).
+# No afecta la correctitud (la selección tilda solo los vouchers del Excel); es defensa
+# en profundidad. 0 = desactivado.
+VOUCHER_MAX_GAP = 50_000
+
+# Filtro "Service Date To" del modal Select Vouchers (tab SELECTION). Acota la búsqueda
+# a vouchers con fecha de servicio <= esta fecha, para NO cargar vouchers a futuro.
+# Formato TourplanNX: 'DD/Mon/YYYY' (ej '31/Mar/2026'). None/"" = sin filtro de fecha.
+# Actualizar por lote/período de pago.
+SERVICE_DATE_TO = "31/Mar/2026"  # filtro "Service Date To" (2º input tpdate-servicedate)
+
+# Tolerancia del REMAINDER al guardar un invoice. Si |INVOICE - ESPERADO| la supera,
+# save_invoice es fail-closed: NO guarda. La tolerancia efectiva ESCALA con la cantidad de
+# vouchers cargados para absorber el redondeo acumulado (Excel con decimales vs montos
+# redondeados de TourplanNX): tol = max(base, por_voucher * n_cargados).
+# Como la selección tilda SOLO vouchers nuestros por número (nunca ajenos), el descuadre
+# restante es redondeo; un voucher con monto realmente distinto (> por_voucher) igual se
+# detecta. Ajustar por_voucher si aparecen redondeos mayores.
+INVOICE_REMAINDER_TOLERANCE = 0.01        # piso absoluto
+INVOICE_TOLERANCE_PER_VOUCHER = 0.10      # margen de redondeo por voucher cargado
+
 # ── Cheques (orden de pago) ─────────────────────────────────────────────────────
 # Prefijo de la REFERENCE del cheque (análogo a "INV" del invoice): OP{row_index}{code}.
 CHEQUE_REFERENCE_PREFIX = "OP"

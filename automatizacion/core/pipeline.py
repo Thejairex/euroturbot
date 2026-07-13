@@ -13,6 +13,7 @@ from config.settings import (
     READ_EXISTING_REFS,
     VOUCHER_CHUNK_SIZE,
     VOUCHER_MAX_RANGE_WIDTH,
+    VOUCHER_MAX_GAP,
 )
 from config.urls import spa_url
 from core.exceptions import SupplierNotFoundError
@@ -28,9 +29,12 @@ from modules.transaction_creator import (
     add_vouchers_via_search,
     read_invoice_totals,
     save_invoice,
+    invoice_tolerance,
     abort_transaction,
     VoucherSearchTimeout,
     ReferenceExistsError,
+    InvoiceMismatchError,
+    InvoiceSaveError,
 )
 from utils.logger import log
 
@@ -63,7 +67,7 @@ def _bloque_desde(sub: list[dict]) -> dict:
 
 
 def chunk_records_for_invoice(
-    records: list[dict], chunk_size: int, max_range_width: int = 0
+    records: list[dict], chunk_size: int, max_range_width: int = 0, max_gap: int = 0
 ) -> list[dict]:
     """Divide los records de una moneda en bloques (cada uno = una factura), ordenados
     por número de voucher.
@@ -71,7 +75,9 @@ def chunk_records_for_invoice(
     Un bloque se corta cuando se cumple lo PRIMERO de:
       - juntar `chunk_size` vouchers, o
       - que el ancho del rango (voucher_actual - voucher_inicio_del_bloque) supere
-        `max_range_width` (evita el timeout SQL del SEARCH por rango muy ancho).
+        `max_range_width` (evita el timeout SQL del SEARCH por rango muy ancho), o
+      - que el hueco al voucher anterior (voucher_actual - voucher_previo) supere
+        `max_gap` (mantiene los rangos densos: menos vouchers ajenos en el SEARCH).
 
     Un proveedor chico (<= chunk_size y rango angosto) resulta en 1 solo bloque →
     comportamiento idéntico al flujo masivo de una sola factura.
@@ -85,18 +91,22 @@ def chunk_records_for_invoice(
     bloques: list[dict] = []
     actual: list[dict] = []
     inicio = None
+    previo = None
     for rec in ordenados:
         n = _voucher_int(rec.get("voucher"))
         if actual:
             excede_cant = len(actual) >= chunk_size
             excede_ancho = max_range_width > 0 and inicio is not None and n - inicio > max_range_width
-            if excede_cant or excede_ancho:
+            excede_hueco = max_gap > 0 and previo is not None and n and n - previo > max_gap
+            if excede_cant or excede_ancho or excede_hueco:
                 bloques.append(_bloque_desde(actual))
                 actual = []
                 inicio = None
         if not actual:
             inicio = n if n else None
         actual.append(rec)
+        if n:
+            previo = n
     if actual:
         bloques.append(_bloque_desde(actual))
     return bloques
@@ -234,7 +244,8 @@ def _cargar_chunk_factura(
     `piso` vouchers. Los chunks irrecuperables se devuelven como fallidos.
 
     Returns:
-        (ok_indices, failed_indices) — row_index de las filas cargadas / fallidas.
+        (ok_indices, failed_indices, skipped_indices) — filas cargadas / fallidas
+        (reintentables) / salteadas (vouchers no disponibles en la lupa, no reintentables).
     """
     indices = [r["row_index"] for r in chunk_records]
     vouchers = [r["voucher"] for r in chunk_records]
@@ -259,24 +270,67 @@ def _cargar_chunk_factura(
                 pass
             if tracker and filename:
                 tracker.mark_rows_ok_bulk(filename, indices, reference=ref)
-            return (indices, [])
+            return (indices, [], [])
         result = add_vouchers_via_search(page, vouchers, vfrom, vto, select_all=select_all)
-        if len(result["loaded"]) == 0:
-            log.warning("    Chunk sin vouchers cargados (%s) — abortando", currency)
+        # Mapear vouchers cargados → filas. Solo se tildaron vouchers NUESTROS (nunca
+        # ajenos), así que loaded_recs es un subconjunto correcto del chunk.
+        loaded_set = {str(v).replace(",", "").strip() for v in result["loaded"]}
+        loaded_recs = [r for r in chunk_records
+                       if str(r["voucher"]).replace(",", "").strip() in loaded_set]
+        loaded_idx = [r["row_index"] for r in loaded_recs]
+        notfound_idx = [r["row_index"] for r in chunk_records if r["row_index"] not in set(loaded_idx)]
+
+        if not loaded_recs:
+            # Ningún voucher nuestro está en la lupa (no disponibles en TourplanNX).
+            # Se saltean (no es reintentable) — igual criterio que el modo chico.
+            log.warning("    Chunk %s: ningún voucher del Excel en la lupa — %d filas skipped", ref, len(indices))
             abort_transaction(page)
             if tracker and filename:
-                tracker.mark_rows_failed_bulk(filename, indices, "Sin vouchers cargados en lupa")
-            return ([], indices)
-        totals = read_invoice_totals(page)
-        rem = abs(totals.get("remainder", 9999))
-        if rem >= 0.01:
-            log.warning("    REMAINDER=%.2f en chunk %s — guardando igual", totals.get("remainder", 0), currency)
-        save_invoice(page)
-        log.info("    Factura guardada: %d filas (%s)", len(indices), currency)
+                tracker.mark_rows_skipped_bulk(filename, indices)
+            return ([], [], indices)
+
+        if notfound_idx:
+            log.warning("    Chunk %s: %d/%d vouchers no en la lupa → se cargan los %d hallados, "
+                        "el resto skipped: %s",
+                        ref, len(notfound_idx), len(vouchers), len(loaded_recs), result.get("not_found"))
+
+        # Validar contra el costo de los vouchers REALMENTE cargados (no el total del chunk
+        # completo, que incluye los salteados). save_invoice es fail-closed: si INVOICE no
+        # coincide con esa suma → InvoiceMismatchError (no guarda).
+        expected_loaded = sum(float(r.get("product_cost") or 0) for r in loaded_recs)
+        save_invoice(page, tolerance=invoice_tolerance(len(loaded_recs)), expected_override=expected_loaded)
+        log.info("    Factura guardada: %d cargados, %d salteados (%s)",
+                 len(loaded_idx), len(notfound_idx), currency)
         if tracker and filename:
-            tracker.mark_rows_ok_bulk(filename, indices, reference=ref)
-            log.info("  [DEBUG] Tracker: %d filas → ok (ref=%s)", len(indices), ref)
-        return (indices, [])
+            tracker.mark_rows_ok_bulk(filename, loaded_idx, reference=ref)
+            if notfound_idx:
+                tracker.mark_rows_skipped_bulk(filename, notfound_idx)
+            log.info("  [DEBUG] Tracker: %d ok, %d skipped (ref=%s)", len(loaded_idx), len(notfound_idx), ref)
+        return (loaded_idx, [], notfound_idx)
+    except InvoiceMismatchError as e:
+        # Descuadre: el rango trajo vouchers de más/de menos. NO se guardó. Abortar y
+        # marcar failed para revisión (el reporte de descuadres los recopila del log).
+        log.error("    DESCUADRE en chunk %s ref=%s — %s — %d filas failed (NO guardado)",
+                  currency, ref, e, len(indices))
+        try:
+            abort_transaction(page)
+        except Exception:
+            pass
+        if tracker and filename:
+            tracker.mark_rows_failed_bulk(filename, indices, f"Descuadre (no guardado): {e}")
+        return ([], indices, [])
+    except InvoiceSaveError as e:
+        # TourplanNX rechazó el SAVE (ej. falta tipo de cambio CLP→ARS para la fecha). NO es
+        # un bug ni un cuelgue: es dato/config del servidor. Marcar failed con el motivo real
+        # (reintentable: si cargan el tipo de cambio, la próxima corrida lo guarda).
+        log.error("    SAVE RECHAZADO en chunk %s ref=%s — %s — %d filas failed", currency, ref, e, len(indices))
+        try:
+            abort_transaction(page)
+        except Exception:
+            pass
+        if tracker and filename:
+            tracker.mark_rows_failed_bulk(filename, indices, f"SAVE rechazado: {e}")
+        return ([], indices, [])
     except VoucherSearchTimeout:
         try:
             abort_transaction(page)
@@ -287,15 +341,15 @@ def _cargar_chunk_factura(
                       len(chunk_records), len(indices))
             if tracker and filename:
                 tracker.mark_rows_failed_bulk(filename, indices, "VoucherSearchTimeout en chunk mínimo")
-            return ([], indices)
+            return ([], indices, [])
         mid = len(chunk_records) // 2
         log.warning("    VoucherSearchTimeout en chunk de %d (%s) — sub-dividiendo en %d + %d",
                     len(chunk_records), currency, mid, len(chunk_records) - mid)
-        ok1, f1 = _cargar_chunk_factura(
+        ok1, f1, s1 = _cargar_chunk_factura(
             page, supplier_code, currency, chunk_records[:mid], select_all, piso, tracker, filename)
-        ok2, f2 = _cargar_chunk_factura(
+        ok2, f2, s2 = _cargar_chunk_factura(
             page, supplier_code, currency, chunk_records[mid:], select_all, piso, tracker, filename)
-        return (ok1 + ok2, f1 + f2)
+        return (ok1 + ok2, f1 + f2, s1 + s2)
     except Exception as e:
         # Cualquier otro fallo del chunk (SAVE colgado, modal inesperado, etc.): abortar
         # y marcar este chunk failed sin tirar abajo los demás chunks del proveedor.
@@ -306,7 +360,7 @@ def _cargar_chunk_factura(
             pass
         if tracker and filename:
             tracker.mark_rows_failed_bulk(filename, indices, str(e))
-        return ([], indices)
+        return ([], indices, [])
 
 
 _MESES = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
@@ -481,9 +535,13 @@ def process_supplier_group(
         if tracker:
             tracker.mark_rows_skipped_bulk(filename, skipped_mep)
 
-    # Proveedores grandes (> umbral): se cargan en modo CHUNKED (varias facturas de
-    # VOUCHER_CHUNK_SIZE c/u, SELECT ALL por chunk). Antes se saltaban; ahora se cargan.
-    es_masivo = bool(max_vouchers and max_vouchers > 0 and group["size"] > max_vouchers)
+    # UNIFICADO: TODOS los proveedores se cargan por el camino CHUNKED (chunks de
+    # VOUCHER_CHUNK_SIZE c/u vía _cargar_chunk_factura). Ese camino tiene la selección
+    # híbrida (leer grid → SELECT ALL si el rango es limpio, si no por-voucher con scroll),
+    # carga parcial (expected_override), fail-closed y manejo de errores de SAVE. El viejo
+    # "modo chico" leía el grid una sola vez sin scroll → subseleccionaba con >~20 vouchers
+    # por moneda (ej. 1EXPED ARS=233 → solo 20). Queda como legacy (rama else) sin uso.
+    es_masivo = group["size"] > 0
 
     # Posponer proveedores monstruo: si superan el umbral duro se dejan 'pending' (sin
     # tocar) y se registran, para procesarlos en una corrida dedicada. Evita que un
@@ -551,7 +609,7 @@ def process_supplier_group(
             # ── Modo CHUNKED (proveedores masivos): varias facturas, SELECT ALL por chunk ──
             if es_masivo:
                 chunks = chunk_records_for_invoice(
-                    records_for_currency, VOUCHER_CHUNK_SIZE, VOUCHER_MAX_RANGE_WIDTH)
+                    records_for_currency, VOUCHER_CHUNK_SIZE, VOUCHER_MAX_RANGE_WIDTH, VOUCHER_MAX_GAP)
                 log.info("    Moneda %s: total=%.2f, %d vouchers en %d factura(s) (chunked)",
                          currency, total, len(records_for_currency), len(chunks))
                 stats.set_activity(currency=currency, voucher_total=len(records_for_currency), voucher_idx=0)
@@ -590,7 +648,7 @@ def process_supplier_group(
                         continue
                     log.info("    Factura %d/%d: %d vouchers (rango %s-%s)",
                              ci, len(chunks), len(chunk["records"]), chunk["vfrom"], chunk["vto"])
-                    ok_idx, failed_idx = _cargar_chunk_factura(
+                    ok_idx, failed_idx, skipped_idx = _cargar_chunk_factura(
                         page, supplier_code, currency, chunk["records"], select_all=True,
                         tracker=tracker, filename=filename)
                     for idx in ok_idx:
@@ -599,6 +657,14 @@ def process_supplier_group(
                             "filename": filename, "supplier_code": supplier_code,
                             "voucher": "", "currency": currency,
                             "status": "ok", "error": None, "row_index": idx,
+                        })
+                    for idx in skipped_idx:
+                        per_row_status[idx] = "skipped"
+                        stats.add_voucher_result({
+                            "filename": filename, "supplier_code": supplier_code,
+                            "voucher": "", "currency": currency,
+                            "status": "skipped", "error": "Voucher no disponible en la lupa",
+                            "row_index": idx,
                         })
                     for idx in failed_idx:
                         per_row_status[idx] = "failed"
@@ -697,8 +763,11 @@ def process_supplier_group(
                 group_error = f"VoucherSearchTimeout ({currency})"
                 break
 
-            # Registrar resultado por fila
+            # Clasificar filas: not_found → skipped ya; el resto queda como CANDIDATA a ok,
+            # pero NO se marca ok hasta confirmar el SAVE (fail-closed: si el invoice no
+            # cuadra no se guarda y esas filas deben quedar failed, no ok).
             not_found_set = {str(v).replace(",", "") for v in result["not_found"]}
+            ok_candidates: list[dict] = []
             for rec in records_for_currency:
                 norm = str(rec["voucher"]).replace(",", "")
                 if norm in not_found_set:
@@ -722,12 +791,7 @@ def process_supplier_group(
                     })
                     per_row_status[rec["row_index"]] = "skipped"
                 else:
-                    stats.add_voucher_result({
-                        "filename": filename, "supplier_code": supplier_code,
-                        "voucher": rec["voucher"], "currency": currency,
-                        "status": "ok", "error": None, "row_index": rec["row_index"],
-                    })
-                    per_row_status[rec["row_index"]] = "ok"
+                    ok_candidates.append(rec)
 
             loaded_count = len(result["loaded"])
 
@@ -743,14 +807,27 @@ def process_supplier_group(
 
                 totals = read_invoice_totals(page)
                 remainder = abs(totals.get("remainder", 9999))
+                tol = invoice_tolerance(len(ok_candidates))
 
-                if remainder < 0.01:
-                    log.info("    Totales cuadran: %s %s — REMAINDER=%.2f", supplier_code, currency, remainder)
+                if remainder <= tol:
+                    log.info("    Totales cuadran: %s %s — REMAINDER=%.2f (tol=%.2f)",
+                             supplier_code, currency, remainder, tol)
                 else:
-                    log.warning("    REMAINDER=%.4f para %s %s — guardando igual",
-                                totals.get("remainder", "?"), supplier_code, currency)
+                    log.warning("    REMAINDER=%.4f para %s %s (tol=%.2f) — NO se guarda (fail-closed)",
+                                totals.get("remainder", "?"), supplier_code, currency, tol)
 
-                save_invoice(page)
+                # Fail-closed: si el total no cuadra, save_invoice lanza InvoiceMismatchError
+                # y NO guarda; lo captura el handler general del proveedor (marca failed).
+                save_invoice(page, tolerance=tol)
+
+                # SAVE confirmado: recién ahora marcar las filas cargadas como ok.
+                for rec in ok_candidates:
+                    stats.add_voucher_result({
+                        "filename": filename, "supplier_code": supplier_code,
+                        "voucher": rec["voucher"], "currency": currency,
+                        "status": "ok", "error": None, "row_index": rec["row_index"],
+                    })
+                    per_row_status[rec["row_index"]] = "ok"
 
         exit_supplier(page)
 

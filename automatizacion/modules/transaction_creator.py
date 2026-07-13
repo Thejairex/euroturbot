@@ -1,6 +1,17 @@
 from playwright.sync_api import Page, expect
 
+from config.settings import (
+    SERVICE_DATE_TO,
+    INVOICE_REMAINDER_TOLERANCE,
+    INVOICE_TOLERANCE_PER_VOUCHER,
+)
 from utils.logger import log
+
+
+def invoice_tolerance(n_vouchers: int) -> float:
+    """Tolerancia efectiva del REMAINDER: escala con la cantidad de vouchers cargados para
+    absorber el redondeo acumulado. tol = max(piso, por_voucher * n)."""
+    return max(INVOICE_REMAINDER_TOLERANCE, INVOICE_TOLERANCE_PER_VOUCHER * max(1, n_vouchers))
 
 MODAL_TIMEOUT = 30000
 # Espera máxima para que el botón lupa ("Search for Voucher") aparezca después de OK.
@@ -35,6 +46,30 @@ class VoucherSearchTimeout(Exception):
 class ReferenceExistsError(Exception):
     """TourplanNX rechazó la transacción con error 1038: la referencia ya existe."""
     pass
+
+
+class InvoiceSaveError(Exception):
+    """TourplanNX rechazó el SAVE del invoice con un diálogo de error (ej. 'Error! 1006 …
+    No currency conversion found from CLP to ARS …'). NO es un cuelgue: es un error de
+    datos/config del servidor (falta tipo de cambio, cuenta, etc.). Se marca el chunk failed
+    con el mensaje real en vez de esperar el timeout completo."""
+    pass
+
+
+class InvoiceMismatchError(Exception):
+    """El total del invoice no coincide con el esperado (REMAINDER != 0).
+
+    Se lanza ANTES de guardar (fail-closed): en vez de aceptar el warning "Invoice total
+    mismatch" y guardar una factura con vouchers de más/de menos, se aborta la transacción
+    y se marca el chunk como failed para revisión. Previene el bug de sobre-selección en
+    modo masivo (SELECT ALL barría vouchers ajenos dentro del rango numérico).
+    """
+    def __init__(self, message: str, invoice_total: float | None = None,
+                 expected_total: float | None = None, remainder: float | None = None):
+        super().__init__(message)
+        self.invoice_total = invoice_total
+        self.expected_total = expected_total
+        self.remainder = remainder
 
 
 def _wait_for_spinner(page: Page) -> None:
@@ -281,13 +316,43 @@ def read_invoice_totals(page: Page) -> dict:
     return parsed
 
 
-def save_invoice(page: Page) -> None:
-    """Guarda el invoice (Insert Invoice) clickeando SAVE.
+def save_invoice(page: Page, tolerance: float = INVOICE_REMAINDER_TOLERANCE,
+                 expected_override: float | None = None) -> None:
+    """Guarda el invoice (Insert Invoice) clickeando SAVE — fail-closed ante descuadre.
 
-    Funciona aunque el REMAINDER no sea 0 (TourplanNX lo permite). Cuando el
-    REMAINDER != 0, TourplanNX abre un diálogo "Warning, Invoice total mismatch"
-    con botones NO/YES; se confirma con YES.
+    FAIL-CLOSED: si el total cargado no coincide con lo esperado (|diferencia| > tolerance)
+    NO se guarda. Previene el bug de sobre-selección (cargar vouchers ajenos).
+
+    `expected_override`: cuando algunos vouchers del chunk NO estaban en la lupa y se
+    cargaron solo los hallados, el EXPECTED del formulario (que se tipeó con el total del
+    chunk COMPLETO) ya no aplica. Se pasa acá la suma del costo de los vouchers REALMENTE
+    cargados; la validación compara INVOICE contra ese valor. Como solo tildamos vouchers
+    NUESTROS (nunca ajenos), que INVOICE == suma(costo de los cargados) garantiza que la
+    factura contiene exactamente los vouchers correctos con sus montos correctos. En ese
+    caso, el warning "Invoice total mismatch" (por los vouchers salteados) se acepta con YES.
+
+    Comportamiento:
+      1. Se calcula la diferencia efectiva (INVOICE − esperado); si excede la tolerancia →
+         InvoiceMismatchError (sin clickear SAVE). Frena descuadres reales.
+      2. Dentro de tolerancia: SAVE, y si aparece el warning se confirma con YES.
+
+    Raises:
+        InvoiceMismatchError: el invoice excede la tolerancia; NO se guardó nada.
     """
+    # 1. Guarda primaria: verificar que el total cuadre ANTES de intentar guardar.
+    totals = read_invoice_totals(page)
+    invoice_total = totals.get("invoice_total", 0.0)
+    esperado = expected_override if expected_override is not None else totals.get("expected_total", 0.0)
+    remainder = invoice_total - esperado
+    if abs(remainder) > tolerance:
+        raise InvoiceMismatchError(
+            f"Invoice descuadrado (INVOICE={invoice_total:.2f} "
+            f"ESPERADO={esperado:.2f} DIF={remainder:.2f}) — no se guarda (fail-closed)",
+            invoice_total=invoice_total,
+            expected_total=esperado,
+            remainder=remainder,
+        )
+
     dialogs_before = page.get_by_role("dialog").count()
     dialog = page.get_by_role("dialog").last
     save_btn = dialog.locator(INVOICE_SAVE)
@@ -295,30 +360,92 @@ def save_invoice(page: Page) -> None:
     save_btn.click(force=True)
     page.wait_for_timeout(1000)
 
-    # Si el invoice no cuadra, aparece el diálogo de confirmación. Click YES.
+    # 2. Dentro de tolerancia (redondeo): si TourplanNX abre el warning de descuadre,
+    #    confirmar con YES para aceptar la diferencia mínima y guardar. Seguro: los
+    #    descuadres grandes ya se rechazaron en el paso 1 (nunca llegan acá).
     try:
         warning = page.get_by_role("dialog").filter(has_text="Invoice total mismatch")
         if warning.count() > 0:
             warning.last.get_by_role("button", name="YES").click()
-            log.info("    Warning de descuadre confirmado (YES)")
+            log.info("    Descuadre de redondeo (REMAINDER=%.2f <= %.2f) aceptado con YES", remainder, tolerance)
             page.wait_for_timeout(800)
     except Exception:
         pass
 
     # Señal de guardado = el modal Insert Invoice se cierra (dialogs disminuyen).
     # NO se espera el spinner: queda colgado (bug cosmético del UI) aunque el SAVE
-    # haya completado. Polling hasta SAVE_TIMEOUT_MS.
+    # haya completado. Polling hasta SAVE_TIMEOUT_MS. En cada vuelta se chequea también si
+    # TourplanNX abrió un diálogo de ERROR (ej. falta tipo de cambio) → falla rápido.
     waited = 0
     step = 1000
     while waited < SAVE_TIMEOUT_MS:
         if page.get_by_role("dialog").count() < dialogs_before:
             log.info("    Invoice guardado (SAVE)")
             return
+        err = _read_save_error(page)
+        if err:
+            # TourplanNX rechazó el SAVE con un diálogo de error. Cerrarlo y fallar con el
+            # motivo real (no esperar el timeout completo ni loguear "cuelgue").
+            _dismiss_save_error(page)
+            raise InvoiceSaveError(err)
         page.wait_for_timeout(step)
         waited += step
+    # Timeout real sin diálogo de error: volcar diagnóstico y fallar.
+    try:
+        diag = page.evaluate("""
+            () => Array.from(document.querySelectorAll('dialog[open]')).map(d =>
+                (d.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 120))
+        """)
+        log.warning("    [DIAG SAVE] dialogs_before=%d, ahora=%d, abiertos=%s",
+                    dialogs_before, page.get_by_role("dialog").count(), diag)
+    except Exception:
+        pass
     raise RuntimeError(
         "El modal de invoice sigue abierto tras SAVE (timeout) — posible cuelgue de CreateAPInvoice"
     )
+
+
+# Patrones de error de TourplanNX al guardar (diálogo que bloquea el cierre del modal).
+_SAVE_ERROR_PATTERNS = ["Error!", "Error adding Invoice", "No currency conversion", "conversion found"]
+
+
+def _read_save_error(page: Page) -> str | None:
+    """Devuelve el texto del diálogo de error tras SAVE (ej. 'Error! 1006 … No currency
+    conversion found from CLP to ARS …'), o None si no hay error."""
+    return page.evaluate("""
+        (patterns) => {
+            const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
+            for (const d of dialogs) {
+                const t = (d.textContent || '').replace(/\\s+/g, ' ').trim();
+                if (patterns.some(p => t.includes(p))) {
+                    // Recortar al fragmento del error (desde 'Error')
+                    const i = t.indexOf('Error');
+                    return (i >= 0 ? t.slice(i) : t).slice(0, 200);
+                }
+            }
+            return null;
+        }
+    """, _SAVE_ERROR_PATTERNS)
+
+
+def _dismiss_save_error(page: Page) -> None:
+    """Cierra el diálogo de error del SAVE (click en su botón: OK/Close/Exit)."""
+    try:
+        page.evaluate("""
+            (patterns) => {
+                const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
+                for (const d of dialogs) {
+                    const t = (d.textContent || '');
+                    if (patterns.some(p => t.includes(p))) {
+                        const btn = d.querySelector('button');
+                        if (btn) { btn.click(); return; }
+                    }
+                }
+            }
+        """, _SAVE_ERROR_PATTERNS)
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
 
 
 def exit_invoice_line(page: Page) -> None:
@@ -356,6 +483,65 @@ def _set_voucher_range(page: Page, voucher_from: str | None, voucher_to: str | N
         }
     """, [voucher_from, voucher_to])
     log.info("    Rango vouchers: FROM=%s TO=%s", voucher_from, voucher_to)
+
+
+def _set_service_date_to(page: Page, value: str) -> bool:
+    """Setea el filtro "Service Date To" (tab SELECTION del modal Select Vouchers) para
+    NO traer vouchers a futuro. Formato TourplanNX 'DD/Mon/YYYY' (ej '31/Mar/2026').
+
+    Usa el setter nativo + eventos (no .fill(), que rompe el binding del datepicker Angular).
+
+    ESTRUCTURA REAL (verificada en vivo): los campos de fecha vienen en PARES con la MISMA
+    clase — 'tpdate-servicedate' aparece 2 veces: el [0] es "Service Date From" y el [1]
+    es "Service Date To" (igual que el rango de vouchers usa inputs[0]=FROM, [1]=TO). Se
+    identifica SOLO por el token de clase 'tpdate-...' (nunca por el className completo, que
+    incluye 'ng-touched' con "to" y hacía matchear mal). Si hay un token 'servicedateto'
+    explícito se usa ese; si no, se usa el SEGUNDO 'tpdate-servicedate'. Si no hay ninguno,
+    NO setea nada (auto-seguro) y loguea los tokens para diagnóstico.
+
+    Devuelve True solo si encontró y seteó el campo "Service Date To".
+    """
+    result = page.evaluate("""
+        (val) => {
+            const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
+            const modal = dialogs[dialogs.length - 1];
+            if (!modal) return { set: false, dateTokens: [] };
+            const setter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value').set;
+            const fire = (el) => {
+                setter.call(el, val);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new Event('blur', { bubbles: true }));
+            };
+            const usable = (el) => el && !el.readOnly && !el.disabled;
+            // Tokens tpdate-* de cada input de fecha (ignora ng-*, tpdateinput, etc.).
+            const tpdateTokens = (i) => Array.from(i.classList).filter(c => c.startsWith('tpdate-'));
+            const dateInputs = Array.from(modal.querySelectorAll('input'))
+                .filter(i => tpdateTokens(i).length > 0);
+            const dateTokens = dateInputs.map(i => tpdateTokens(i).join(' '));
+            const norm = (i) => tpdateTokens(i).map(t => t.replace('tpdate-', '').replace(/-/g, '').toLowerCase());
+
+            // (a) token 'servicedateto' explícito.
+            let target = dateInputs.find(i => norm(i).some(t => t === 'servicedateto' || t.includes('servicedateto')));
+            // (b) par 'servicedate' → el SEGUNDO (en orden DOM) es el "To".
+            if (!target) {
+                const pair = dateInputs.filter(i => norm(i).some(t => t === 'servicedate'));
+                if (pair.length >= 2) target = pair[1];
+            }
+            if (usable(target)) {
+                fire(target);
+                return { set: true, dateTokens, used: tpdateTokens(target).join(' ') };
+            }
+            return { set: false, dateTokens };
+        }
+    """, value)
+    if result.get("set"):
+        log.info("    Service Date To (filtro) = %s [%s]", value, result.get("used", ""))
+        return True
+    log.warning("    Service Date To: NO se aplicó filtro (no se halló campo). "
+                "Tokens de fecha en el modal: %s", result.get("dateTokens", []))
+    return False
 
 
 _VOUCHER_ERROR_PATTERNS = [
@@ -437,6 +623,206 @@ def _wait_for_search_results(page: Page, timeout_ms: int = 35000) -> int:
     return _read_found_count(page) or 0
 
 
+def _read_visible_grid_vouchers(page: Page) -> list[dict]:
+    """Lee las filas actualmente renderizadas del grid del modal Select Vouchers.
+
+    El grid VIRTUALIZA: solo monta en el DOM las filas visibles. Devuelve
+    [{index, voucher}] de lo que hay montado en este instante."""
+    return page.evaluate("""
+        () => Array.from(document.querySelectorAll('tr.tpgrid'))
+                  .map((row, idx) => {
+                      const vc = row.querySelector('td.tpcol-vouchernumber');
+                      return vc ? { index: idx, voucher: (vc.textContent || '').replace(/,/g, '').trim() } : null;
+                  })
+                  .filter(Boolean)
+    """) or []
+
+
+def _scroll_grid_next(page: Page) -> bool:
+    """Scrollea el grid del modal Select Vouchers hacia abajo para montar más filas
+    (grid virtualizado). Estrategia doble: (1) scrollear el ancestro scrolleable; si no
+    se encuentra o no se mueve, (2) traer la ÚLTIMA fila renderizada a la vista
+    (scrollIntoView), que fuerza al virtualizador a montar el siguiente bloque.
+
+    Devuelve True si el contenedor se movió (best-effort; el llamador no depende de esto
+    para terminar: usa el crecimiento de filas vistas)."""
+    return page.evaluate("""
+        () => {
+            const rows = document.querySelectorAll('tr.tpgrid');
+            if (!rows.length) return false;
+            const last = rows[rows.length - 1];
+            // 1) Ancestro scrolleable (overflow auto/scroll y con contenido de sobra).
+            let el = last, cont = null;
+            while (el && el.parentElement) {
+                el = el.parentElement;
+                const oy = getComputedStyle(el).overflowY;
+                if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 2) { cont = el; break; }
+            }
+            let moved = false;
+            if (cont) {
+                const before = cont.scrollTop;
+                // Paso con SOLAPAMIENTO (0.6 del viewport) para no saltear filas que el
+                // virtualizador recicla entre lecturas (0.85 dejaba huecos → vouchers no vistos).
+                cont.scrollTop = Math.min(cont.scrollTop + Math.floor(cont.clientHeight * 0.6), cont.scrollHeight);
+                moved = cont.scrollTop > before + 1;
+            }
+            // 2) Fallback: traer la última fila a la vista (monta el siguiente bloque).
+            if (!moved) {
+                try { last.scrollIntoView({ block: 'end', inline: 'nearest' }); } catch (e) {}
+            }
+            return moved;
+        }
+    """)
+
+
+def _scroll_grid_top(page: Page) -> None:
+    """Vuelve el grid del modal Select Vouchers al tope (para una segunda pasada que
+    recupere filas que la primera no llegó a ver)."""
+    page.evaluate("""
+        () => {
+            const rows = document.querySelectorAll('tr.tpgrid');
+            if (!rows.length) return;
+            let el = rows[0];
+            while (el && el.parentElement) {
+                el = el.parentElement;
+                const oy = getComputedStyle(el).overflowY;
+                if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 2) { el.scrollTop = 0; return; }
+            }
+        }
+    """)
+
+
+def _read_all_grid_vouchers(page: Page, found: int) -> set[str]:
+    """Recorre el grid virtualizado en SOLO LECTURA y devuelve el conjunto de números de
+    voucher presentes. No tilda nada (por eso es mucho más rápido y confiable que la
+    selección: sin recálculo server-side por tick). 2 pasadas para maximizar cobertura.
+
+    Sirve para decidir si el rango está "limpio" (todos los vouchers son nuestros → SELECT
+    ALL seguro) o trae ajenos (→ selección por-voucher)."""
+    seen: set[str] = set()
+    MAX_STALE = 4
+    iters = 0
+    max_iters = max(60, found // 3 + 20)
+    try:
+        page.locator("tr.tpgrid td.tpcol-vouchernumber").first.wait_for(state="visible", timeout=8000)
+    except Exception:
+        pass
+    for passes in range(2):
+        if passes > 0:
+            _scroll_grid_top(page)
+            page.wait_for_timeout(500)
+        stale = 0
+        while stale < MAX_STALE and iters < max_iters:
+            iters += 1
+            before = len(seen)
+            for r in _read_visible_grid_vouchers(page):
+                seen.add(r["voucher"])
+            _scroll_grid_next(page)
+            page.wait_for_timeout(350)
+            if len(seen) > before:
+                stale = 0
+            else:
+                stale += 1
+    log.info("    Lectura del grid: %d números únicos vistos (Found=%d, %d iters)", len(seen), found, iters)
+    return seen
+
+
+def _select_target_vouchers_scrolling(page: Page, target: set[str], found: int) -> list[str]:
+    """Recorre el grid virtualizado del modal Select Vouchers tildando SOLO los vouchers
+    que están en `target` (los del Excel). Nunca hace SELECT ALL, así no arrastra vouchers
+    ajenos que el servidor devuelva dentro del mismo rango.
+
+    Estrategia: leer filas visibles → tildar las que estén en target y falten → scrollear
+    → repetir hasta cubrir todos los target o agotar el grid (sin filas nuevas).
+
+    Devuelve la lista de vouchers efectivamente tildados (loaded)."""
+    remaining = set(target)
+    loaded: list[str] = []
+    seen: set[str] = set()
+    stale = 0
+    MAX_STALE = 4  # scrolls consecutivos sin filas nuevas ni selección → fin
+    iters = 0
+    # Tope duro de iteraciones: cada scroll debería montar un bloque; con margen amplio.
+    max_iters = max(60, found // 3 + 20)
+
+    try:
+        page.locator("tr.tpgrid td.tpcol-vouchernumber").first.wait_for(state="visible", timeout=8000)
+    except Exception:
+        pass
+    try:
+        page.locator("tr.tpgrid td.tpcol-checkbox").first.wait_for(state="visible", timeout=8000)
+    except Exception:
+        pass
+
+    # Arrancar SIEMPRE desde el tope: la lectura previa del grid (_read_all_grid_vouchers)
+    # deja el scroll abajo; sin esto, se empezaría por el final y se verían solo las últimas
+    # filas (bug observado: 16/100 con "23 filas vistas").
+    _scroll_grid_top(page)
+    page.wait_for_timeout(400)
+
+    # Hasta 2 pasadas top→bottom: la 1ª puede saltear filas por reciclado del grid; la 2ª
+    # (desde el tope) recupera los target que quedaron sin tildar.
+    MAX_PASSES = 2
+    for passes in range(MAX_PASSES):
+        if not remaining:
+            break
+        if passes > 0:
+            _scroll_grid_top(page)
+            page.wait_for_timeout(500)
+        stale = 0
+        while remaining and stale < MAX_STALE and iters < max_iters:
+            iters += 1
+            visible = _read_visible_grid_vouchers(page)
+            seen_before = len(seen)
+            selected_this_pass = 0
+
+            for r in visible:
+                v = r["voucher"]
+                seen.add(v)
+                if v not in remaining:
+                    continue
+                # Reubicar la fila por número de voucher AL MOMENTO de clickear (el índice
+                # puede cambiar entre lectura y click por re-render del grid virtual).
+                row_idx = page.evaluate("""
+                    (vnum) => {
+                        const rows = Array.from(document.querySelectorAll('tr.tpgrid'));
+                        for (let i = 0; i < rows.length; i++) {
+                            const vc = rows[i].querySelector('td.tpcol-vouchernumber');
+                            if (vc && vc.textContent.replace(/,/g, '').trim() === vnum) return i;
+                        }
+                        return -1;
+                    }
+                """, v)
+                if row_idx < 0:
+                    continue
+                try:
+                    page.locator("tr.tpgrid").nth(row_idx).locator("td.tpcol-checkbox").click(timeout=8000)
+                    # NECESARIO: cada tildado dispara un recálculo server-side (spinner) del
+                    # total del invoice. Hay que esperarlo antes del próximo tick / de leer el
+                    # total; si no, los ticks no se registran y el INVOICE queda subvaluado
+                    # (verificado: sin esta espera el total daba ~5x menos → fail-closed erróneo).
+                    _wait_for_spinner(page)
+                    loaded.append(v)
+                    remaining.discard(v)
+                    selected_this_pass += 1
+                except Exception:
+                    pass
+
+            _scroll_grid_next(page)
+            page.wait_for_timeout(450)
+
+            # Progreso REAL = tildamos algo o el scroll reveló filas nuevas. Si tras scrollear
+            # no aparecen vouchers nuevos MAX_STALE veces, se llegó al fondo del grid.
+            if selected_this_pass > 0 or len(seen) > seen_before:
+                stale = 0
+            else:
+                stale += 1
+
+    log.info("    Selección por voucher: %d/%d tildados (Found=%d, %d filas vistas, %d iters, %d pasadas)",
+             len(loaded), len(target), found, len(seen), iters, passes + 1)
+    return loaded
+
+
 def add_vouchers_via_search(
     page: Page,
     vouchers: list[str],
@@ -491,6 +877,10 @@ def add_vouchers_via_search(
     if voucher_from or voucher_to:
         _set_voucher_range(page, voucher_from, voucher_to)
 
+    # 3b. Filtro Service Date To: NO traer vouchers a futuro (solo <= fecha de corte).
+    if SERVICE_DATE_TO:
+        _set_service_date_to(page, SERVICE_DATE_TO)
+
     # 4. Click SEARCH (button.tpsearch — evita ambigüedad con "Search for Supplier")
     sv.locator("button.tpsearch").click()
     log.info("    SEARCH ejecutado (FROM=%s TO=%s)...", voucher_from, voucher_to)
@@ -502,7 +892,10 @@ def add_vouchers_via_search(
     found = _wait_for_search_results(page)
     log.info("    SEARCH resultados: Found=%d", found)
 
-    # ── Modo masivo: SELECT ALL siempre (carga todo lo pendiente del rango) ──
+    # ── Modo masivo: HÍBRIDO. Si el rango es "limpio" (todos los vouchers del grid son
+    # nuestros) → SELECT ALL (una operación server-side, total confiable). Si trae ajenos
+    # → selección por-voucher. En ambos casos el fail-closed del SAVE valida el total, así
+    # que aunque la lectura se saltee algo, nunca se guarda una factura mal.
     if select_all:
         if found <= 0:
             log.warning("    SEARCH sin resultados (Found=0) — saliendo sin cargar")
@@ -512,21 +905,51 @@ def add_vouchers_via_search(
             except Exception:
                 pass
             return {"loaded": [], "not_found": sorted(target)}
-        sv.locator("button.tpselectall").click()
-        # esperar a que OK se habilite (la selección server-side tarda)
+
+        # Leer (solo lectura) qué vouchers hay en el grid para decidir la estrategia.
+        grid = _read_all_grid_vouchers(page, found)
+        ajenos = grid - target
+        present = sorted(grid & target)
+        missing = sorted(target - grid)
+
+        if present and not ajenos:
+            # Rango limpio: todo lo del grid es nuestro → SELECT ALL confiable.
+            log.info("    Rango limpio (%d únicos, 0 ajenos) → SELECT ALL: %d present, %d missing",
+                     len(grid), len(present), len(missing))
+            sv.locator("button.tpselectall").click()
+            try:
+                expect(sv.get_by_role("button", name="OK")).to_be_enabled(timeout=MODAL_TIMEOUT)
+            except Exception:
+                pass
+            loaded, not_found = present, missing
+        else:
+            # Hay vouchers ajenos en el rango (o no se detectó ninguno nuestro): selección
+            # por-voucher para no arrastrar ajenos (el fail-closed igual protege).
+            if ajenos:
+                log.warning("    Rango con %d vouchers ajenos → selección por-voucher (no SELECT ALL)",
+                            len(ajenos))
+            loaded = _select_target_vouchers_scrolling(page, target, found)
+            not_found = sorted(target - set(loaded))
+
+        if not loaded:
+            log.warning("    Ningún voucher del Excel para cargar — saliendo sin cargar")
+            try:
+                sv.get_by_role("button", name="EXIT").click(force=True)
+                sv.wait_for(state="hidden", timeout=MODAL_TIMEOUT)
+            except Exception:
+                pass
+            return {"loaded": [], "not_found": sorted(target)}
+
         try:
             expect(sv.get_by_role("button", name="OK")).to_be_enabled(timeout=MODAL_TIMEOUT)
         except Exception:
             pass
-        log.info("    SELECT ALL: %d vouchers (todo lo pendiente del rango)", found)
         sv.get_by_role("button", name="OK").click()
-        log.info("    OK -> cargando %d lineas...", found)
+        log.info("    OK -> cargando %d present (%d no encontrados)...", len(loaded), len(not_found))
         sv.wait_for(state="hidden", timeout=30000)
         page.wait_for_timeout(800)
-        log.info("    Lupa completada (masivo): %d cargados", found)
-        # 'loaded' es un marcador con `found` elementos (el grid virtualiza, no hay
-        # números exactos); el matching por-voucher no aplica en este modo.
-        return {"loaded": list(range(found)), "not_found": []}
+        log.info("    Lupa completada (masivo): %d cargados, %d no encontrados", len(loaded), len(not_found))
+        return {"loaded": loaded, "not_found": not_found}
 
     # ── Modo chico (comportamiento original): matching contra el Excel ──
     try:
