@@ -823,6 +823,51 @@ def _select_target_vouchers_scrolling(page: Page, target: set[str], found: int) 
     return loaded
 
 
+def _select_vouchers_by_search(page: Page, sv, target: set[str]) -> tuple[list[str], list[str]]:
+    """Selección DETERMINÍSTICA (sin depender del scroll del grid virtual): busca cada voucher
+    por su número exacto (VOUCHER FROM=TO=v) → el grid devuelve solo ese → SELECT ALL lo tilda.
+    Acumula la selección búsqueda tras búsqueda dentro de la MISMA lupa; el caller hace UN OK.
+
+    Devuelve (loaded, not_found):
+      - loaded: vouchers cuyo SEARCH devolvió resultado y se tildaron.
+      - not_found: vouchers con Found=0 (no están en TourplanNX) o error de búsqueda.
+
+    Nota: si TourplanNX reseteara la selección en cada SEARCH (a verificar en vivo), el total
+    final sería el de un solo voucher → el fail-closed lo detecta y no guarda. En ese caso se
+    pasa al modo per-lupa (un OK por voucher) — ver caller."""
+    loaded: list[str] = []
+    not_found: list[str] = []
+    ordered = sorted(target)
+    for i, v in enumerate(ordered, 1):
+        _set_voucher_range(page, v, v)
+        try:
+            sv.locator("button.tpsearch").click()
+        except Exception:
+            not_found.append(v)
+            continue
+        page.wait_for_timeout(250)
+        try:
+            # Timeout corto: presente → responde en ~1s; ausente (Found=0) → espera el tope.
+            found_v = _wait_for_search_results(page, timeout_ms=8000)
+        except VoucherSearchTimeout:
+            not_found.append(v)
+            continue
+        if found_v and found_v >= 1:
+            try:
+                sv.locator("button.tpselectall").click()
+                _wait_for_spinner(page)
+                loaded.append(v)
+            except Exception:
+                not_found.append(v)
+        else:
+            not_found.append(v)
+        if i % 25 == 0:
+            log.info("    Búsqueda por voucher: %d/%d procesados (%d cargados)", i, len(ordered), len(loaded))
+    log.info("    Búsqueda por voucher COMPLETA: %d/%d cargados, %d no encontrados",
+             len(loaded), len(target), len(not_found))
+    return loaded, not_found
+
+
 def add_vouchers_via_search(
     page: Page,
     vouchers: list[str],
@@ -912,24 +957,25 @@ def add_vouchers_via_search(
         present = sorted(grid & target)
         missing = sorted(target - grid)
 
-        if present and not ajenos:
-            # Rango limpio: todo lo del grid es nuestro → SELECT ALL confiable.
-            log.info("    Rango limpio (%d únicos, 0 ajenos) → SELECT ALL: %d present, %d missing",
-                     len(grid), len(present), len(missing))
-            sv.locator("button.tpselectall").click()
-            try:
-                expect(sv.get_by_role("button", name="OK")).to_be_enabled(timeout=MODAL_TIMEOUT)
-            except Exception:
-                pass
-            loaded, not_found = present, missing
+        # ÚNICA primitiva viable: SELECT ALL (una operación). Cada op de la lupa cuesta
+        # ~30s de recálculo server-side, así que tildar/buscar voucher-por-voucher es
+        # inviable (90 min/chunk). Estrategia: SELECT ALL del rango + fail-closed.
+        #  - Rango limpio (sin ajenos): INVOICE == Σ costo(present) → GUARDA.
+        #  - Rango sucio (con ajenos): SELECT ALL los incluye → INVOICE != esperado →
+        #    fail-closed NO guarda (se reporta para carga manual). Nunca guarda mal.
+        if ajenos:
+            log.warning("    Rango con %d ajenos (%d present, %d missing) → SELECT ALL; "
+                        "si el total no cuadra, fail-closed (no guarda)",
+                        len(ajenos), len(present), len(missing))
         else:
-            # Hay vouchers ajenos en el rango (o no se detectó ninguno nuestro): selección
-            # por-voucher para no arrastrar ajenos (el fail-closed igual protege).
-            if ajenos:
-                log.warning("    Rango con %d vouchers ajenos → selección por-voucher (no SELECT ALL)",
-                            len(ajenos))
-            loaded = _select_target_vouchers_scrolling(page, target, found)
-            not_found = sorted(target - set(loaded))
+            log.info("    Rango limpio (%d únicos) → SELECT ALL: %d present, %d missing",
+                     len(grid), len(present), len(missing))
+        sv.locator("button.tpselectall").click()
+        try:
+            expect(sv.get_by_role("button", name="OK")).to_be_enabled(timeout=MODAL_TIMEOUT)
+        except Exception:
+            pass
+        loaded, not_found = present, missing
 
         if not loaded:
             log.warning("    Ningún voucher del Excel para cargar — saliendo sin cargar")
