@@ -957,25 +957,25 @@ def add_vouchers_via_search(
         present = sorted(grid & target)
         missing = sorted(target - grid)
 
-        # ÚNICA primitiva viable: SELECT ALL (una operación). Cada op de la lupa cuesta
-        # ~30s de recálculo server-side, así que tildar/buscar voucher-por-voucher es
-        # inviable (90 min/chunk). Estrategia: SELECT ALL del rango + fail-closed.
-        #  - Rango limpio (sin ajenos): INVOICE == Σ costo(present) → GUARDA.
-        #  - Rango sucio (con ajenos): SELECT ALL los incluye → INVOICE != esperado →
-        #    fail-closed NO guarda (se reporta para carga manual). Nunca guarda mal.
+        # HÍBRIDO (precisión sobre velocidad, decidido con el negocio):
+        #  - Rango LIMPIO (sin ajenos): SELECT ALL — ya es preciso (todo es nuestro) y rápido.
+        #  - Rango SUCIO (con ajenos): selección VOUCHER-POR-VOUCHER — busca cada voucher del
+        #    Excel por su número exacto y tilda solo ese, así NO entran los ajenos. Es lento
+        #    (~30s/voucher, limitación del servidor) pero preciso. El fail-closed valida igual.
         if ajenos:
-            log.warning("    Rango con %d ajenos (%d present, %d missing) → SELECT ALL; "
-                        "si el total no cuadra, fail-closed (no guarda)",
-                        len(ajenos), len(present), len(missing))
+            log.warning("    Rango con %d ajenos (%d present, %d missing) → tildar SOLO los "
+                        "presentes en el grid (precisión)", len(ajenos), len(present), len(missing))
+            loaded = _select_target_vouchers_scrolling(page, set(present), found)
+            not_found = sorted(target - set(loaded))
         else:
             log.info("    Rango limpio (%d únicos) → SELECT ALL: %d present, %d missing",
                      len(grid), len(present), len(missing))
-        sv.locator("button.tpselectall").click()
-        try:
-            expect(sv.get_by_role("button", name="OK")).to_be_enabled(timeout=MODAL_TIMEOUT)
-        except Exception:
-            pass
-        loaded, not_found = present, missing
+            sv.locator("button.tpselectall").click()
+            try:
+                expect(sv.get_by_role("button", name="OK")).to_be_enabled(timeout=MODAL_TIMEOUT)
+            except Exception:
+                pass
+            loaded, not_found = present, missing
 
         if not loaded:
             log.warning("    Ningún voucher del Excel para cargar — saliendo sin cargar")
