@@ -107,6 +107,7 @@ class ProcessTracker:
                 supplier_code TEXT NOT NULL,
                 currency TEXT NOT NULL,
                 reference TEXT,
+                invoice_reference TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
                 payment_due_date TEXT,
                 error TEXT,
@@ -150,6 +151,12 @@ class ProcessTracker:
                 "WHERE table_name = 'processed_rows' AND table_schema = 'public'"
             )
             existing = {r["column_name"] for r in cur.fetchall()}
+
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'processed_cheques' AND table_schema = 'public'"
+            )
+            existing_cheques = {r["column_name"] for r in cur.fetchall()}
         else:
             for s in stmts:
                 self._conn.execute(s)
@@ -157,11 +164,19 @@ class ProcessTracker:
                 r["name"]
                 for r in self._conn.execute("PRAGMA table_info(processed_rows)")
             }
+            existing_cheques = {
+                r["name"]
+                for r in self._conn.execute("PRAGMA table_info(processed_cheques)")
+            }
 
         for col in ("supplier_code", "currency", "transaction_reference",
                     "product_cost", "supplier_name"):
             if col not in existing:
                 self._execute(f"ALTER TABLE processed_rows ADD COLUMN {col} TEXT")
+
+        for col in ("invoice_reference",):
+            if col not in existing_cheques:
+                self._execute(f"ALTER TABLE processed_cheques ADD COLUMN {col} TEXT")
 
         self._conn.commit()
 
@@ -518,35 +533,43 @@ class ProcessTracker:
     # ── Tracking de cheques (orden de pago) ───────────────────────────────────
 
     def _upsert_cheque(self, supplier_code, currency, reference, status,
-                       payment_due_date=None, error=None):
+                       payment_due_date=None, error=None, invoice_reference=None):
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         if self._db_type == "pgsql":
             self._execute(
                 "INSERT INTO processed_cheques "
-                "(supplier_code, currency, reference, status, payment_due_date, error, created_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                "(supplier_code, currency, reference, invoice_reference, status, "
+                "payment_due_date, error, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT (supplier_code, currency) DO UPDATE SET "
-                "reference = EXCLUDED.reference, status = EXCLUDED.status, "
+                "reference = EXCLUDED.reference, invoice_reference = EXCLUDED.invoice_reference, "
+                "status = EXCLUDED.status, "
                 "payment_due_date = EXCLUDED.payment_due_date, error = EXCLUDED.error, "
                 "created_at = EXCLUDED.created_at",
-                (supplier_code, currency, reference, status, payment_due_date, error, now),
+                (supplier_code, currency, reference, invoice_reference, status,
+                 payment_due_date, error, now),
             )
         else:
             self._execute(
                 "INSERT OR REPLACE INTO processed_cheques "
-                "(supplier_code, currency, reference, status, payment_due_date, error, created_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                (supplier_code, currency, reference, status, payment_due_date, error, now),
+                "(supplier_code, currency, reference, invoice_reference, status, "
+                "payment_due_date, error, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (supplier_code, currency, reference, invoice_reference, status,
+                 payment_due_date, error, now),
             )
         self._conn.commit()
 
     def mark_cheque_ok(self, supplier_code: str, currency: str, reference: str,
-                       payment_due_date: str | None = None):
-        self._upsert_cheque(supplier_code, currency, reference, "ok", payment_due_date, None)
+                       payment_due_date: str | None = None, invoice_reference: str | None = None):
+        self._upsert_cheque(supplier_code, currency, reference, "ok", payment_due_date, None,
+                            invoice_reference)
 
     def mark_cheque_failed(self, supplier_code: str, currency: str, reference: str,
-                           error: str, payment_due_date: str | None = None):
-        self._upsert_cheque(supplier_code, currency, reference, "failed", payment_due_date, error)
+                           error: str, payment_due_date: str | None = None,
+                           invoice_reference: str | None = None):
+        self._upsert_cheque(supplier_code, currency, reference, "failed", payment_due_date, error,
+                            invoice_reference)
 
     def is_cheque_done(self, supplier_code: str, currency: str) -> bool:
         """True si ya existe un cheque 'ok' para ese proveedor+moneda (idempotencia)."""
@@ -559,10 +582,36 @@ class ProcessTracker:
 
     def get_cheques_summary(self) -> list[dict]:
         rows = self._fetchall(
-            "SELECT supplier_code, currency, reference, status, payment_due_date, "
-            "error, created_at FROM processed_cheques ORDER BY supplier_code, currency"
+            "SELECT supplier_code, currency, reference, invoice_reference, status, "
+            "payment_due_date, error, created_at "
+            "FROM processed_cheques ORDER BY supplier_code, currency"
         )
         return [dict(r) for r in rows]
+
+    def count_cheques_missing_invoice_ref(self) -> int:
+        """Cuenta cheques con reference tipo 'OP...' que aún no tienen invoice_reference."""
+        row = self._fetchone(
+            "SELECT COUNT(*) AS cnt FROM processed_cheques "
+            "WHERE reference LIKE %s "
+            "AND (invoice_reference IS NULL OR invoice_reference = '')",
+            ("OP%",),
+        )
+        return row["cnt"] if row else 0
+
+    def backfill_invoice_references(self) -> int:
+        """Rellena invoice_reference de cheques existentes derivándolo de reference:
+        'OP{row_index}{supplier_code}' -> 'INV{row_index}{supplier_code}'.
+
+        Solo toca filas con reference 'OP...' e invoice_reference vacío (idempotente).
+        """
+        cur = self._execute(
+            "UPDATE processed_cheques SET invoice_reference = 'INV' || substr(reference, 3) "
+            "WHERE reference LIKE %s "
+            "AND (invoice_reference IS NULL OR invoice_reference = '')",
+            ("OP%",),
+        )
+        self._conn.commit()
+        return cur.rowcount
 
     # ── Gestión general ───────────────────────────────────────────────────────
 

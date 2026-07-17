@@ -13,6 +13,10 @@ Subcomandos (cwd = automatizacion/):
   python -m checks.main run --supplier 6IRE1 --no-tracker --visible
   python -m checks.main run --suppliers 6IRE1,1USH03
 
+  # Backfill de invoice_reference en cheques ya registrados (OP{idx}{code} -> INV{idx}{code}):
+  python -m checks.main backfill-invoice-ref --dry-run   # solo cuenta, no modifica
+  python -m checks.main backfill-invoice-ref             # aplica y reporta filas actualizadas
+
 Sin subcomando se asume `filter` (compatibilidad).
 """
 import argparse
@@ -36,6 +40,19 @@ def cmd_filter(args) -> None:
                 f"proveedor={v['supplier_code']!s:<10}  moneda={v['currency']!s:<4}  "
                 f"({v['filename']})"
             )
+    finally:
+        tracker.close()
+
+
+def cmd_backfill_invoice_ref(args) -> None:
+    tracker = ProcessTracker()
+    try:
+        pending = tracker.count_cheques_missing_invoice_ref()
+        if args.dry_run:
+            print(f"Cheques a actualizar (dry-run, sin modificar): {pending}")
+            return
+        updated = tracker.backfill_invoice_references()
+        print(f"invoice_reference actualizado en {updated} cheque(s).")
     finally:
         tracker.close()
 
@@ -109,10 +126,17 @@ def main() -> None:
                        help="No usar tracker (test directo; requiere --supplier)")
     p_run.add_argument("--visible", action="store_true", help="Navegador visible")
 
+    p_backfill = sub.add_parser("backfill-invoice-ref",
+                                help="Rellenar invoice_reference en cheques ya registrados")
+    p_backfill.add_argument("--dry-run", action="store_true",
+                            help="Solo contar filas a actualizar, sin modificar")
+
     args = parser.parse_args()
 
     if args.command == "run":
         cmd_run(args)
+    elif args.command == "backfill-invoice-ref":
+        cmd_backfill_invoice_ref(args)
     else:
         # default: filter (compatibilidad si no se pasa subcomando)
         if args.command is None:

@@ -115,6 +115,7 @@ def run_cheque_pipeline(page, stats, tracker: ProcessTracker | None = None,
                 # para que ARS y USD no colisionen en OP{row_index}{code}).
                 row_index = currency_rows.get(currency, i)
                 reference = f"{CHEQUE_REFERENCE_PREFIX}{row_index}{supplier_code}"
+                invoice_reference = f"INV{row_index}{supplier_code}"
                 due = summary[currency]["date"]
                 total = summary[currency]["total"]
                 try:
@@ -122,18 +123,21 @@ def run_cheque_pipeline(page, stats, tracker: ProcessTracker | None = None,
                                           CHEQUE_PAYMENT_TYPE)
                     if tracker:
                         if found and found > 0:
-                            tracker.mark_cheque_ok(supplier_code, currency, reference, due)
+                            tracker.mark_cheque_ok(supplier_code, currency, reference, due,
+                                                  invoice_reference=invoice_reference)
                         else:
                             # create_cheque devolvió 0 (modal sin invoices, abortado): NO es
                             # éxito — marcarlo failed para que no quede falsamente 'ok' y la
                             # idempotencia lo reintente.
                             tracker.mark_cheque_failed(
                                 supplier_code, currency, reference,
-                                "Select Invoice Lines sin invoices (FOUND=0)", due)
+                                "Select Invoice Lines sin invoices (FOUND=0)", due,
+                                invoice_reference=invoice_reference)
                 except Exception as e:
                     log.error("  Cheque %s/%s FAILED: %s", supplier_code, currency, e)
                     if tracker:
-                        tracker.mark_cheque_failed(supplier_code, currency, reference, str(e), due)
+                        tracker.mark_cheque_failed(supplier_code, currency, reference, str(e), due,
+                                                  invoice_reference=invoice_reference)
 
             exit_supplier(page)
 
