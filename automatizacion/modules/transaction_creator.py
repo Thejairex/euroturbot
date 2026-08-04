@@ -318,40 +318,26 @@ def read_invoice_totals(page: Page) -> dict:
 
 def save_invoice(page: Page, tolerance: float = INVOICE_REMAINDER_TOLERANCE,
                  expected_override: float | None = None) -> None:
-    """Guarda el invoice (Insert Invoice) clickeando SAVE — fail-closed ante descuadre.
+    """Guarda el invoice (Insert Invoice) clickeando SAVE — SIEMPRE guarda (sistema viejo).
 
-    FAIL-CLOSED: si el total cargado no coincide con lo esperado (|diferencia| > tolerance)
-    NO se guarda. Previene el bug de sobre-selección (cargar vouchers ajenos).
-
-    `expected_override`: cuando algunos vouchers del chunk NO estaban en la lupa y se
-    cargaron solo los hallados, el EXPECTED del formulario (que se tipeó con el total del
-    chunk COMPLETO) ya no aplica. Se pasa acá la suma del costo de los vouchers REALMENTE
-    cargados; la validación compara INVOICE contra ese valor. Como solo tildamos vouchers
-    NUESTROS (nunca ajenos), que INVOICE == suma(costo de los cargados) garantiza que la
-    factura contiene exactamente los vouchers correctos con sus montos correctos. En ese
-    caso, el warning "Invoice total mismatch" (por los vouchers salteados) se acepta con YES.
-
-    Comportamiento:
-      1. Se calcula la diferencia efectiva (INVOICE − esperado); si excede la tolerancia →
-         InvoiceMismatchError (sin clickear SAVE). Frena descuadres reales.
-      2. Dentro de tolerancia: SAVE, y si aparece el warning se confirma con YES.
+    Modo velocidad > precisión: NO es fail-closed. Aunque el total cargado no coincida con
+    lo esperado (por vouchers ajenos que entraron con SELECT ALL sobre el rango), se guarda
+    igual; el warning "Invoice total mismatch" se confirma con YES. El descuadre solo se
+    loguea. (`tolerance`/`expected_override` se conservan en la firma por compatibilidad con
+    el caller, pero ya no bloquean el guardado.)
 
     Raises:
-        InvoiceMismatchError: el invoice excede la tolerancia; NO se guardó nada.
+        InvoiceSaveError: TourplanNX rechazó el SAVE con un diálogo de error real (no un
+            descuadre) — ej. falta tipo de cambio.
     """
-    # 1. Guarda primaria: verificar que el total cuadre ANTES de intentar guardar.
+    # NO fail-closed: leer el total solo para loguear el descuadre; se guarda igual.
     totals = read_invoice_totals(page)
     invoice_total = totals.get("invoice_total", 0.0)
     esperado = expected_override if expected_override is not None else totals.get("expected_total", 0.0)
     remainder = invoice_total - esperado
     if abs(remainder) > tolerance:
-        raise InvoiceMismatchError(
-            f"Invoice descuadrado (INVOICE={invoice_total:.2f} "
-            f"ESPERADO={esperado:.2f} DIF={remainder:.2f}) — no se guarda (fail-closed)",
-            invoice_total=invoice_total,
-            expected_total=esperado,
-            remainder=remainder,
-        )
+        log.warning("    REMAINDER=%.2f (INVOICE=%.2f ESPERADO=%.2f) — guardando igual (modo velocidad)",
+                    remainder, invoice_total, esperado)
 
     dialogs_before = page.get_by_role("dialog").count()
     dialog = page.get_by_role("dialog").last
@@ -360,14 +346,13 @@ def save_invoice(page: Page, tolerance: float = INVOICE_REMAINDER_TOLERANCE,
     save_btn.click(force=True)
     page.wait_for_timeout(1000)
 
-    # 2. Dentro de tolerancia (redondeo): si TourplanNX abre el warning de descuadre,
-    #    confirmar con YES para aceptar la diferencia mínima y guardar. Seguro: los
-    #    descuadres grandes ya se rechazaron en el paso 1 (nunca llegan acá).
+    # Si TourplanNX abre el warning de descuadre ("Invoice total mismatch"), confirmar con
+    # YES para guardar igual (sistema viejo: se tolera cualquier descuadre).
     try:
         warning = page.get_by_role("dialog").filter(has_text="Invoice total mismatch")
         if warning.count() > 0:
             warning.last.get_by_role("button", name="YES").click()
-            log.info("    Descuadre de redondeo (REMAINDER=%.2f <= %.2f) aceptado con YES", remainder, tolerance)
+            log.info("    Descuadre (REMAINDER=%.2f) confirmado con YES — guardando igual", remainder)
             page.wait_for_timeout(800)
     except Exception:
         pass
@@ -937,10 +922,11 @@ def add_vouchers_via_search(
     found = _wait_for_search_results(page)
     log.info("    SEARCH resultados: Found=%d", found)
 
-    # ── Modo masivo: HÍBRIDO. Si el rango es "limpio" (todos los vouchers del grid son
-    # nuestros) → SELECT ALL (una operación server-side, total confiable). Si trae ajenos
-    # → selección por-voucher. En ambos casos el fail-closed del SAVE valida el total, así
-    # que aunque la lectura se saltee algo, nunca se guarda una factura mal.
+    # ── Modo masivo: SELECT ALL incondicional (sistema viejo, velocidad > precisión) ──
+    # Carga TODO lo pendiente del rango (FROM/TO ya seteado + SEARCH ya hecho) con una sola
+    # operación server-side. NO lee la grilla ni tilda voucher-por-voucher. Si el rango trae
+    # vouchers "ajenos", la factura queda con descuadre y se guarda igual (save_invoice tolera).
+    # Todas las filas del chunk se dan por cargadas (not_found vacío).
     if select_all:
         if found <= 0:
             log.warning("    SEARCH sin resultados (Found=0) — saliendo sin cargar")
@@ -951,51 +937,17 @@ def add_vouchers_via_search(
                 pass
             return {"loaded": [], "not_found": sorted(target)}
 
-        # Leer (solo lectura) qué vouchers hay en el grid para decidir la estrategia.
-        grid = _read_all_grid_vouchers(page, found)
-        ajenos = grid - target
-        present = sorted(grid & target)
-        missing = sorted(target - grid)
-
-        # HÍBRIDO (precisión sobre velocidad, decidido con el negocio):
-        #  - Rango LIMPIO (sin ajenos): SELECT ALL — ya es preciso (todo es nuestro) y rápido.
-        #  - Rango SUCIO (con ajenos): selección VOUCHER-POR-VOUCHER — busca cada voucher del
-        #    Excel por su número exacto y tilda solo ese, así NO entran los ajenos. Es lento
-        #    (~30s/voucher, limitación del servidor) pero preciso. El fail-closed valida igual.
-        if ajenos:
-            log.warning("    Rango con %d ajenos (%d present, %d missing) → tildar SOLO los "
-                        "presentes en el grid (precisión)", len(ajenos), len(present), len(missing))
-            loaded = _select_target_vouchers_scrolling(page, set(present), found)
-            not_found = sorted(target - set(loaded))
-        else:
-            log.info("    Rango limpio (%d únicos) → SELECT ALL: %d present, %d missing",
-                     len(grid), len(present), len(missing))
-            sv.locator("button.tpselectall").click()
-            try:
-                expect(sv.get_by_role("button", name="OK")).to_be_enabled(timeout=MODAL_TIMEOUT)
-            except Exception:
-                pass
-            loaded, not_found = present, missing
-
-        if not loaded:
-            log.warning("    Ningún voucher del Excel para cargar — saliendo sin cargar")
-            try:
-                sv.get_by_role("button", name="EXIT").click(force=True)
-                sv.wait_for(state="hidden", timeout=MODAL_TIMEOUT)
-            except Exception:
-                pass
-            return {"loaded": [], "not_found": sorted(target)}
-
+        sv.locator("button.tpselectall").click()
         try:
             expect(sv.get_by_role("button", name="OK")).to_be_enabled(timeout=MODAL_TIMEOUT)
         except Exception:
             pass
+        log.info("    SELECT ALL: %d vouchers (todo lo pendiente del rango)", found)
         sv.get_by_role("button", name="OK").click()
-        log.info("    OK -> cargando %d present (%d no encontrados)...", len(loaded), len(not_found))
         sv.wait_for(state="hidden", timeout=30000)
         page.wait_for_timeout(800)
-        log.info("    Lupa completada (masivo): %d cargados, %d no encontrados", len(loaded), len(not_found))
-        return {"loaded": loaded, "not_found": not_found}
+        log.info("    Lupa completada (masivo): %d cargados", found)
+        return {"loaded": sorted(target), "not_found": []}
 
     # ── Modo chico (comportamiento original): matching contra el Excel ──
     try:

@@ -11,6 +11,7 @@ from config.settings import (
     BASE_DIR,
     MAX_VOUCHERS_PER_SUPPLIER,
     MAX_VOUCHERS_DEFER_THRESHOLD,
+    PRIORITY_FILE,
     READ_EXISTING_REFS,
     VOUCHER_CHUNK_SIZE,
     VOUCHER_MAX_RANGE_WIDTH,
@@ -42,6 +43,26 @@ from utils.logger import log
 
 INPUT_DIR = BASE_DIR / "input"
 PROCESSED_DIR = BASE_DIR / "processed"
+
+
+def _load_priority_ranks() -> dict[str, int]:
+    """Lee prioridad.xlsx (hoja 'Hoja1', columna 'Code') y devuelve {codigo_upper: rank},
+    donde rank = posición en la lista (para respetar su orden). Vacío si el archivo no
+    existe o no se puede leer — en ese caso no hay reordenamiento por prioridad."""
+    try:
+        df = pd.read_excel(PRIORITY_FILE, sheet_name="Hoja1", dtype=str)
+        ranks: dict[str, int] = {}
+        for code in df["Code"].tolist():
+            c = str(code).strip().upper()
+            if c and c not in ranks:  # primera aparición gana
+                ranks[c] = len(ranks)
+        return ranks
+    except FileNotFoundError:
+        log.info("Sin archivo de prioridad (%s) — orden normal", PRIORITY_FILE)
+        return {}
+    except Exception as e:
+        log.warning("No se pudo cargar prioridad (%s) — orden normal: %s", PRIORITY_FILE, e)
+        return {}
 
 
 class PipelineStopped(Exception):
@@ -425,23 +446,30 @@ def get_data_rows(filepath: Path, sheet_name: str | None = None) -> list[dict]:
         if not sheets:
             return []
         sheet_name = sheets[0]
-    df = pd.read_excel(filepath, sheet_name=sheet_name, dtype=str, header=None)
-    if len(df) < 3:
+    # Aguas abajo (grouping / process_row / init_rows) solo se usan estas 5 columnas de las
+    # 23 del archivo. Leerlas TODAS como objetos sobre 593k filas revienta la RAM (pico de
+    # varios GB); por eso: (1) lectura liviana de las primeras filas para ubicar la fila de
+    # headers, (2) lectura completa pero SOLO de las 5 columnas necesarias (usecols) → ~5x
+    # menos memoria y más rápido.
+    needed = ["Supplier_Code", "Supplier_Name", "Voucher_Number",
+              "Service_Cost_Currency", "ProductCost"]
+    head = pd.read_excel(filepath, sheet_name=sheet_name, dtype=str, header=None, nrows=10)
+    if len(head) < 1:
         return []
-    # Detectar la fila de headers buscando "Supplier_Code" en las primeras 10 filas
     header_row = 2
-    for i in range(min(10, len(df))):
-        if "Supplier_Code" in [str(v) for v in df.iloc[i].tolist()]:
+    for i in range(len(head)):
+        if "Supplier_Code" in [str(v) for v in head.iloc[i].tolist()]:
             header_row = i
             break
-    if len(df) <= header_row + 1:
+    header_vals = [str(v) for v in head.iloc[header_row].tolist()]
+    cols = [c for c in needed if c in header_vals]
+    if "Supplier_Code" not in cols:
         return []
-    headers = df.iloc[header_row].tolist()
-    data = df.iloc[header_row + 1:].copy()
-    data.columns = headers
-    data = data.dropna(axis=1, how="all")
-    data = data.loc[:, data.columns.notna()]
+    data = pd.read_excel(filepath, sheet_name=sheet_name, dtype=str,
+                         header=header_row, usecols=cols)
     data = data.reset_index(drop=True)
+    if data.empty:
+        return []
 
     records = data.to_dict(orient="records")
     reconstruidos = []
@@ -556,7 +584,9 @@ def process_supplier_group(
     # Posponer proveedores monstruo: si superan el umbral duro se dejan 'pending' (sin
     # tocar) y se registran, para procesarlos en una corrida dedicada. Evita que un
     # proveedor enorme (ej. 1ING01, 52k registros) bloquee el resto del archivo.
-    if MAX_VOUCHERS_DEFER_THRESHOLD and group["size"] > MAX_VOUCHERS_DEFER_THRESHOLD:
+    # EXCEPCIÓN: los proveedores de la lista de prioridad NO se posponen (prioridad gana).
+    if (MAX_VOUCHERS_DEFER_THRESHOLD and not group.get("priority")
+            and group["size"] > MAX_VOUCHERS_DEFER_THRESHOLD):
         log.warning("  Proveedor %s POSPUESTO: %d registros > umbral %d — queda 'pending' "
                     "para una corrida dedicada",
                     supplier_code, group["size"], MAX_VOUCHERS_DEFER_THRESHOLD)
@@ -1011,13 +1041,14 @@ def run_pipeline(
             recovered = tracker.reset_processing_to_pending(filename)
             if recovered:
                 log.info("  Recuperadas %d filas 'processing' → 'pending' (corrida previa interrumpida)", recovered)
-            # Reintentar las filas 'failed' y 'skipped' una sola vez por ejecución
+            # Reintentar las filas 'failed' (errores transitorios: falta tipo de cambio,
+            # SAVE rechazado, etc.) una vez por ejecución.
             reintentos = tracker.reset_failed_to_pending(filename)
             if reintentos:
                 log.info("  Reintentando %d filas 'failed' → 'pending' (1 vez por ejecución)", reintentos)
-            skipped_retry = tracker.reset_skipped_to_pending(filename)
-            if skipped_retry:
-                log.info("  Reintentando %d filas 'skipped' → 'pending' (1 vez por ejecución)", skipped_retry)
+            # Las 'skipped' NO se reintentan: son terminales (Found=0 = ya facturado / no en
+            # la lupa, MEP, proveedor inexistente). Reintentarlas cada corrida gastaba horas
+            # en vacíos (~90s/dud). Si hace falta reprocesarlas, resetear el tracker a mano.
             pending_rows = tracker.get_pending_rows(filename)
         else:
             pending_rows = [{"row_index": i} for i in range(len(rows))]
@@ -1050,6 +1081,18 @@ def run_pipeline(
         total = len(pending_rows)
         pending_indices = [r["row_index"] for r in pending_rows]
         groups = group_rows_by_supplier(rows, pending_indices)
+
+        # Prioridad: los proveedores de prioridad.xlsx van PRIMERO (en el orden del
+        # archivo), antes del recorte por lote — así sobreviven al slice de --limit.
+        # sort estable: los no-prioritarios reciben clave grande e igual → conservan su
+        # orden original de Excel. Además marca g["priority"] para saltear el defer.
+        priority_ranks = _load_priority_ranks()
+        if priority_ranks:
+            for g in groups:
+                g["priority"] = g["supplier_code"].strip().upper() in priority_ranks
+            groups.sort(key=lambda g: priority_ranks.get(g["supplier_code"].strip().upper(), 10**9))
+            n_prio = sum(1 for g in groups if g.get("priority"))
+            log.info("  Prioridad: %d proveedor(es) de la lista movidos al frente", n_prio)
 
         if limit is not None and limit > 0 and len(groups) > limit:
             log.info("  Lote: procesando %d de %d proveedores pendientes", limit, len(groups))

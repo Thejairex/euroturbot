@@ -42,7 +42,17 @@ MAX_VOUCHERS_PER_SUPPLIER = 500
 # loguean) en vez de procesarse, para que un proveedor monstruo (ej. 1ING01 con 52k
 # registros) no bloquee al resto del archivo. Se procesan después en una corrida
 # dedicada (subir/anular este umbral, o filtrar por --supplier). 0/None = sin límite.
-MAX_VOUCHERS_DEFER_THRESHOLD = 2000
+MAX_VOUCHERS_DEFER_THRESHOLD = 0
+
+# Lista de proveedores a procesar PRIMERO, por encima de todos (columna 'Code', hoja
+# 'Hoja1'). Está en la raíz del repo (un nivel arriba de BASE_DIR=automatizacion).
+# Vacío/ausente → sin reordenamiento. Los prioritarios además IGNORAN el defer de
+# monstruos (>2000): se procesan igual aunque sean enormes.
+PRIORITY_FILE = BASE_DIR.parent / "prioridad.xlsx"
+
+# Análogo a PRIORITY_FILE pero para el pipeline de cheques (columna 'Supplier_Code',
+# separador ';'). Vacío/ausente → sin reordenamiento.
+PRIORITY_CHEQUE_FILE = BASE_DIR.parent / "prioridad_cheque.csv"
 
 # Consultar GetAccountingTransactions para deduplicar facturas INV* ya creadas.
 # DESACTIVADO: para proveedores con historial grande la respuesta es enorme y el
@@ -70,10 +80,11 @@ VOUCHER_MAX_RANGE_WIDTH = 200_000
 VOUCHER_MAX_GAP = 50_000
 
 # Filtro "Service Date To" del modal Select Vouchers (tab SELECTION). Acota la búsqueda
-# a vouchers con fecha de servicio <= esta fecha, para NO cargar vouchers a futuro.
-# Formato TourplanNX: 'DD/Mon/YYYY' (ej '31/Mar/2026'). None/"" = sin filtro de fecha.
-# Actualizar por lote/período de pago.
-SERVICE_DATE_TO = "31/Mar/2026"  # filtro "Service Date To" (2º input tpdate-servicedate)
+# a vouchers con fecha de servicio <= esta fecha. None/"" = SIN filtro de fecha.
+# DESACTIVADO (rollback al sistema viejo, que no tenía este filtro): estaba fijo en una
+# fecha ya vencida (31/Mar/2026) y devolvía Found=0 al excluir los vouchers actuales.
+# Formato TourplanNX si se reactiva: 'DD/Mon/YYYY'.
+SERVICE_DATE_TO = None  # sin filtro de Service Date (como el sistema viejo)
 
 # Tolerancia del REMAINDER al guardar un invoice. Si |INVOICE - ESPERADO| la supera,
 # save_invoice es fail-closed: NO guarda. La tolerancia efectiva ESCALA con la cantidad de

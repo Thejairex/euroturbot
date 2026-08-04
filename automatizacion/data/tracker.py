@@ -613,6 +613,63 @@ class ProcessTracker:
         self._conn.commit()
         return cur.rowcount
 
+    def backfill_voucher_references(self, dry_run: bool = False) -> dict:
+        """Precalcula transaction_reference para filas 'pending' sin ese valor,
+        agrupando por (filename, supplier_code, currency) y replicando la agrupación real
+        por chunks (chunk_records_for_invoice) que usa el pipeline al crear invoices.
+
+        Es una PROYECCIÓN, no un valor garantizado: asume que todas las 'pending' de ese
+        proveedor+moneda se procesan juntas en el mismo orden — puede diferir de lo que
+        ocurra en la corrida real según qué esté 'pending' en ese momento. No toca filas
+        'ok'/'failed'/'skipped' (para 'ok' históricas sin reference se validó que esta
+        misma aproximación solo acierta ~52% contra el dato real — no se aplica ahí).
+        """
+        # Import diferido: core.pipeline importa ProcessTracker de este módulo (ciclo).
+        from core.pipeline import chunk_records_for_invoice
+        from config.settings import VOUCHER_CHUNK_SIZE, VOUCHER_MAX_RANGE_WIDTH, VOUCHER_MAX_GAP
+
+        rows = self._fetchall(
+            "SELECT filename, row_index, booking_reference, supplier_code, currency "
+            "FROM processed_rows "
+            "WHERE status = 'pending' "
+            "AND (transaction_reference IS NULL OR transaction_reference = '') "
+            "AND supplier_code IS NOT NULL AND supplier_code <> '' "
+            "AND currency IS NOT NULL AND currency <> ''"
+        )
+
+        groups: dict[tuple, list[dict]] = {}
+        for r in rows:
+            key = (r["filename"], r["supplier_code"].strip(), r["currency"].strip())
+            groups.setdefault(key, []).append({
+                "row_index": r["row_index"],
+                "voucher": r["booking_reference"] or "",
+            })
+
+        updates = []  # (reference, filename, row_index)
+        n_chunks = 0
+        for (filename, supplier_code, currency), records in groups.items():
+            chunks = chunk_records_for_invoice(
+                records, VOUCHER_CHUNK_SIZE, VOUCHER_MAX_RANGE_WIDTH, VOUCHER_MAX_GAP)
+            for chunk in chunks:
+                n_chunks += 1
+                ref = f"INV{chunk['records'][0]['row_index']}{supplier_code}"
+                for rec in chunk["records"]:
+                    updates.append((ref, filename, rec["row_index"]))
+
+        result = {"rows_examined": len(rows), "groups": len(groups),
+                  "chunks": n_chunks, "rows_to_update": len(updates)}
+        if dry_run:
+            return result
+
+        self._executemany(
+            "UPDATE processed_rows SET transaction_reference = %s "
+            "WHERE filename = %s AND row_index = %s",
+            updates,
+        )
+        self._conn.commit()
+        result["rows_updated"] = len(updates)
+        return result
+
     # ── Gestión general ───────────────────────────────────────────────────────
 
     def get_summary(self) -> list[dict]:

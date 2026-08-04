@@ -429,8 +429,11 @@ def parse_args():
     parser.add_argument("--row", type=int, help="Fila específica a procesar (0-indexed)")
     parser.add_argument("--sheet", type=str, default=None, help="Nombre de la hoja (default: auto-detect)")
     parser.add_argument("--no-tracker", action="store_true", help="Desactivar tracker (procesa siempre)")
-    parser.add_argument("--tracker", type=str, choices=["status", "reset"], help="Gestión del tracker")
+    parser.add_argument("--tracker", type=str, choices=["status", "reset", "backfill-references"],
+                        help="Gestión del tracker")
     parser.add_argument("--file", type=str, help="Archivo para --tracker reset")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Con --tracker backfill-references: solo contar, sin modificar")
     parser.add_argument("--all", action="store_true", help="Resetear todo el tracker")
     parser.add_argument("--export-csv", action="store_true", help="Exportar CSV agrupado por proveedor (sin abrir navegador)")
     parser.add_argument("--fresh-login", action="store_true", help="Ignorar sesión guardada y hacer login desde cero")
@@ -473,6 +476,9 @@ def main():
                 print(f"Tracker reseteado para: {args.file}")
             else:
                 print("Usá --file <nombre> o --all")
+        elif args.tracker == "backfill-references":
+            result = tracker.backfill_voucher_references(dry_run=args.dry_run)
+            print(result)
         return
 
     headless = args.headless

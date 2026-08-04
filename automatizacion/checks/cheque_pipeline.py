@@ -9,7 +9,11 @@ tracker, que no la guarda). La REFERENCE es OP{row_index_más_bajo}{supplier_cod
 
 Idempotencia: `processed_cheques` registra cada cheque; los que ya están `ok` se saltan.
 """
-from config.settings import CHEQUE_REFERENCE_PREFIX, CHEQUE_PAYMENT_TYPE, CHEQUE_EXEMPT_FILE
+import csv
+
+from config.settings import (
+    CHEQUE_REFERENCE_PREFIX, CHEQUE_PAYMENT_TYPE, CHEQUE_EXEMPT_FILE, PRIORITY_CHEQUE_FILE,
+)
 from config.urls import spa_url
 from core.exceptions import SupplierNotFoundError
 from data.tracker import ProcessTracker
@@ -20,6 +24,29 @@ from modules.transaction_creator import abort_transaction
 from checks.cheque_creator import create_cheque, read_invoice_summary_by_currency
 from checks.voucher_filter import get_ok_vouchers
 from utils.logger import log
+
+
+def _load_cheque_priority_ranks() -> dict[str, int]:
+    """Lee prioridad_cheque.csv (columna Supplier_Code, separador ';') y devuelve
+    {codigo_upper: rank} = posición en la lista (primera aparición gana). Vacío si el
+    archivo no existe o no se puede leer — en ese caso no hay reordenamiento."""
+    try:
+        with open(PRIORITY_CHEQUE_FILE, encoding="cp1252", newline="") as f:
+            reader = csv.DictReader(f, delimiter=";")
+            ranks: dict[str, int] = {}
+            for row in reader:
+                code = (row.get("Supplier_Code") or "").strip().upper()
+                if not code or code == "#N/D" or code in ranks:
+                    continue
+                ranks[code] = len(ranks)
+            return ranks
+    except FileNotFoundError:
+        log.info("Sin archivo de prioridad de cheques (%s) — orden normal", PRIORITY_CHEQUE_FILE)
+        return {}
+    except Exception as e:
+        log.warning("No se pudo cargar prioridad de cheques (%s) — orden normal: %s",
+                    PRIORITY_CHEQUE_FILE, e)
+        return {}
 
 
 def _load_exempt_suppliers() -> set[str]:
@@ -84,6 +111,14 @@ def run_cheque_pipeline(page, stats, tracker: ProcessTracker | None = None,
     if not plan:
         log.info("No hay proveedores con vouchers ok para emitir cheques")
         return
+
+    priority_ranks = _load_cheque_priority_ranks()
+    if priority_ranks:
+        plan = dict(sorted(plan.items(),
+                            key=lambda kv: priority_ranks.get(kv[0].strip().upper(), 10**9)))
+        n_prio = sum(1 for s in plan if s.strip().upper() in priority_ranks)
+        log.info("Prioridad de cheques: %d/%d proveedores en prioridad_cheque.csv van primero",
+                 n_prio, len(plan))
 
     log.info("Cheques a procesar: %d proveedor(es)", len(plan))
 
