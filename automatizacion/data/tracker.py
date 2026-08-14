@@ -19,18 +19,7 @@ class ProcessTracker:
         self._db_type = "pgsql" if DB_CONNECTION == "pgsql" else "sqlite"
 
         if self._db_type == "pgsql":
-            import psycopg2
-            import psycopg2.extras
-
-            self._conn = psycopg2.connect(
-                host=DB_HOST,
-                port=int(DB_PORT),
-                dbname=DB_DATABASE,
-                user=DB_USERNAME,
-                password=DB_PASSWORD,
-                cursor_factory=psycopg2.extras.RealDictCursor,
-            )
-            self._conn.autocommit = False
+            self._connect_pgsql()
         else:
             import sqlite3
 
@@ -43,15 +32,68 @@ class ProcessTracker:
 
         self._init_db()
 
+    def _connect_pgsql(self):
+        """(Re)conecta a Postgres. Corridas largas (>6h) con huecos de minutos entre
+        queries (esperas del navegador) pueden quedar sin tráfico el tiempo suficiente
+        para que un firewall/NAT intermedio expire la conexión en silencio — ninguno de
+        los dos lados se entera hasta el próximo intento de uso ("server closed the
+        connection unexpectedly"). Se confirmó que Postgres no la cierra activamente
+        (sin idle_in_transaction_session_timeout/statement_timeout configurados, sin
+        restart del contenedor, sin entradas de log en el corte). keepalives fuerza
+        probes TCP periódicos que (a) mantienen viva la conexión ante el NAT/firewall y
+        (b) si igual muere, la detectan en ~40s en vez de recién en la próxima query real.
+        Ver _with_reconnect para la tolerancia si aun así se cae."""
+        import psycopg2
+        import psycopg2.extras
+
+        self._conn = psycopg2.connect(
+            host=DB_HOST,
+            port=int(DB_PORT),
+            dbname=DB_DATABASE,
+            user=DB_USERNAME,
+            password=DB_PASSWORD,
+            cursor_factory=psycopg2.extras.RealDictCursor,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=4,
+        )
+        self._conn.autocommit = False
+
+    def _is_connection_error(self, exc: Exception) -> bool:
+        if self._db_type != "pgsql":
+            return False
+        import psycopg2
+        return isinstance(exc, (psycopg2.OperationalError, psycopg2.InterfaceError))
+
+    def _with_reconnect(self, fn):
+        """Ejecuta `fn()` reconectando UNA vez si la conexión a Postgres se cayó
+        (ej. 'server closed the connection unexpectedly', 'connection already closed').
+        Cualquier trabajo sin commit en la transacción muerta se pierde — es el mismo
+        comportamiento que ya tolera el pipeline (chunk/fila queda 'failed' y se
+        reintenta en la próxima corrida vía reset_failed_to_pending)."""
+        try:
+            return fn()
+        except Exception as e:
+            if not self._is_connection_error(e):
+                raise
+            from utils.logger import log
+            log.warning("  [DB] Conexión perdida (%s) — reconectando...", e)
+            self._connect_pgsql()
+            return fn()
+
     # ── Helpers de ejecución ──────────────────────────────────────────────────
 
     def _execute(self, sql: str, params=None):
         """Ejecuta SQL usando %s como placeholder (se convierte a ? en SQLite)."""
         if self._db_type == "sqlite":
             return self._conn.execute(sql.replace("%s", "?"), params or ())
-        cur = self._conn.cursor()
-        cur.execute(sql, params or ())
-        return cur
+
+        def run():
+            cur = self._conn.cursor()
+            cur.execute(sql, params or ())
+            return cur
+        return self._with_reconnect(run)
 
     def _executemany(self, sql: str, data):
         if self._db_type == "sqlite":
@@ -60,9 +102,21 @@ class ProcessTracker:
         # inviable para archivos grandes contra una base remota (ej. init_rows de 593k filas
         # = ~10 min). execute_batch agrupa en lotes (page_size) → cientos de round-trips.
         import psycopg2.extras
-        cur = self._conn.cursor()
-        psycopg2.extras.execute_batch(cur, sql, data, page_size=1000)
-        return cur
+
+        def run():
+            cur = self._conn.cursor()
+            psycopg2.extras.execute_batch(cur, sql, data, page_size=1000)
+            return cur
+        return self._with_reconnect(run)
+
+    def _commit(self):
+        """Commit con reconexión: si la conexión murió justo antes del commit, la
+        transacción en curso se pierde (se retoma en la próxima corrida), pero no
+        interrumpe el resto de la ejecución."""
+        if self._db_type == "sqlite":
+            self._conn.commit()
+            return
+        self._with_reconnect(lambda: self._conn.commit())
 
     def _fetchone(self, sql: str, params=None):
         return self._execute(sql, params).fetchone()
@@ -178,7 +232,7 @@ class ProcessTracker:
             if col not in existing_cheques:
                 self._execute(f"ALTER TABLE processed_cheques ADD COLUMN {col} TEXT")
 
-        self._conn.commit()
+        self._commit()
 
     # ── Utilidades ────────────────────────────────────────────────────────────
 
@@ -217,7 +271,7 @@ class ProcessTracker:
                 "VALUES (%s, %s, 'pending', %s, %s)",
                 (filename, file_hash, total_rows, now),
             )
-        self._conn.commit()
+        self._commit()
 
     def mark_file_processing(self, filename: str):
         self._execute(
@@ -225,7 +279,7 @@ class ProcessTracker:
             "WHERE filename = %s",
             (time.strftime("%Y-%m-%d %H:%M:%S"), filename),
         )
-        self._conn.commit()
+        self._commit()
 
     def mark_file_completed(self, filename: str, error: str | None = None):
         ok = self._fetchone(
@@ -244,7 +298,7 @@ class ProcessTracker:
             "error = %s, finished_at = %s WHERE filename = %s",
             (status, ok, failed, error, time.strftime("%Y-%m-%d %H:%M:%S"), filename),
         )
-        self._conn.commit()
+        self._commit()
 
     def is_file_pending(self, filename: str, file_hash: str) -> bool:
         row = self.get_file_status(filename)
@@ -303,7 +357,7 @@ class ProcessTracker:
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 data,
             )
-        self._conn.commit()
+        self._commit()
 
     def get_pending_rows(self, filename: str) -> list:
         return self._fetchall(
@@ -362,7 +416,7 @@ class ProcessTracker:
             "WHERE filename = %s AND row_index = %s",
             (filename, row_index),
         )
-        self._conn.commit()
+        self._commit()
 
     def mark_rows_processing_bulk(self, filename: str, row_indices: list[int]):
         """Marca muchas filas como 'processing' en un solo lote. Evita el cuello de
@@ -375,7 +429,7 @@ class ProcessTracker:
             "WHERE filename = %s AND row_index = %s",
             [(filename, idx) for idx in row_indices],
         )
-        self._conn.commit()
+        self._commit()
 
     def mark_row_ok(self, filename: str, row_index: int):
         self._execute(
@@ -383,7 +437,7 @@ class ProcessTracker:
             "WHERE filename = %s AND row_index = %s",
             (time.strftime("%Y-%m-%d %H:%M:%S"), filename, row_index),
         )
-        self._conn.commit()
+        self._commit()
 
     def mark_row_failed(self, filename: str, row_index: int, error: str):
         self._execute(
@@ -391,7 +445,7 @@ class ProcessTracker:
             "WHERE filename = %s AND row_index = %s",
             (error, time.strftime("%Y-%m-%d %H:%M:%S"), filename, row_index),
         )
-        self._conn.commit()
+        self._commit()
 
     def mark_row_skipped(self, filename: str, row_index: int):
         self._execute(
@@ -399,7 +453,7 @@ class ProcessTracker:
             "WHERE filename = %s AND row_index = %s",
             (time.strftime("%Y-%m-%d %H:%M:%S"), filename, row_index),
         )
-        self._conn.commit()
+        self._commit()
 
     def mark_rows_ok_bulk(self, filename: str, row_indices: list[int], reference: str | None = None):
         if not row_indices:
@@ -417,7 +471,7 @@ class ProcessTracker:
                 "WHERE filename = %s AND row_index = %s",
                 [(now, filename, idx) for idx in row_indices],
             )
-        self._conn.commit()
+        self._commit()
 
     def mark_rows_failed_bulk(self, filename: str, row_indices: list[int], error: str):
         if not row_indices:
@@ -428,7 +482,7 @@ class ProcessTracker:
             "WHERE filename = %s AND row_index = %s",
             [(error, now, filename, idx) for idx in row_indices],
         )
-        self._conn.commit()
+        self._commit()
 
     def mark_rows_skipped_bulk(self, filename: str, row_indices: list[int]):
         if not row_indices:
@@ -439,7 +493,7 @@ class ProcessTracker:
             "WHERE filename = %s AND row_index = %s",
             [(now, filename, idx) for idx in row_indices],
         )
-        self._conn.commit()
+        self._commit()
 
     def mark_row_pending(self, filename: str, row_index: int):
         self._execute(
@@ -447,7 +501,7 @@ class ProcessTracker:
             "WHERE filename = %s AND row_index = %s",
             (filename, row_index),
         )
-        self._conn.commit()
+        self._commit()
 
     def reset_processing_to_pending(self, filename: str) -> int:
         cur = self._execute(
@@ -455,7 +509,7 @@ class ProcessTracker:
             "WHERE filename = %s AND status = 'processing'",
             (filename,),
         )
-        self._conn.commit()
+        self._commit()
         return cur.rowcount
 
     def reset_failed_to_pending(self, filename: str) -> int:
@@ -465,7 +519,7 @@ class ProcessTracker:
             "WHERE filename = %s AND status = 'failed'",
             (filename,),
         )
-        self._conn.commit()
+        self._commit()
         return cur.rowcount
 
     def reset_skipped_to_pending(self, filename: str) -> int:
@@ -475,7 +529,7 @@ class ProcessTracker:
             "WHERE filename = %s AND status = 'skipped'",
             (filename,),
         )
-        self._conn.commit()
+        self._commit()
         return cur.rowcount
 
     def count_failed_rows(self, filename: str) -> int:
@@ -558,7 +612,7 @@ class ProcessTracker:
                 (supplier_code, currency, reference, invoice_reference, status,
                  payment_due_date, error, now),
             )
-        self._conn.commit()
+        self._commit()
 
     def mark_cheque_ok(self, supplier_code: str, currency: str, reference: str,
                        payment_due_date: str | None = None, invoice_reference: str | None = None):
@@ -610,7 +664,7 @@ class ProcessTracker:
             "AND (invoice_reference IS NULL OR invoice_reference = '')",
             ("OP%",),
         )
-        self._conn.commit()
+        self._commit()
         return cur.rowcount
 
     def backfill_voucher_references(self, dry_run: bool = False) -> dict:
@@ -666,7 +720,7 @@ class ProcessTracker:
             "WHERE filename = %s AND row_index = %s",
             updates,
         )
-        self._conn.commit()
+        self._commit()
         result["rows_updated"] = len(updates)
         return result
 
@@ -683,13 +737,13 @@ class ProcessTracker:
     def reset_file(self, filename: str):
         self._execute("DELETE FROM processed_rows WHERE filename = %s", (filename,))
         self._execute("DELETE FROM processed_files WHERE filename = %s", (filename,))
-        self._conn.commit()
+        self._commit()
 
     def reset_all(self):
         self._execute("DELETE FROM processed_rows")
         self._execute("DELETE FROM processed_files")
         self._execute("DELETE FROM processed_cheques")
-        self._conn.commit()
+        self._commit()
 
     def close(self):
         self._conn.close()

@@ -937,17 +937,28 @@ def add_vouchers_via_search(
                 pass
             return {"loaded": [], "not_found": sorted(target)}
 
-        sv.locator("button.tpselectall").click()
+        loaded = _select_target_vouchers_scrolling(page, target, found)
+        not_found = sorted(target - set(loaded))
+
+        if not loaded:
+            log.warning("    Ningún voucher del chunk encontrado en la lupa — saliendo sin cargar")
+            try:
+                sv.get_by_role("button", name="EXIT").click(force=True)
+                sv.wait_for(state="hidden", timeout=MODAL_TIMEOUT)
+            except Exception:
+                pass
+            return {"loaded": [], "not_found": sorted(target)}
+
         try:
             expect(sv.get_by_role("button", name="OK")).to_be_enabled(timeout=MODAL_TIMEOUT)
         except Exception:
             pass
-        log.info("    SELECT ALL: %d vouchers (todo lo pendiente del rango)", found)
         sv.get_by_role("button", name="OK").click()
         sv.wait_for(state="hidden", timeout=30000)
         page.wait_for_timeout(800)
-        log.info("    Lupa completada (masivo): %d cargados", found)
-        return {"loaded": sorted(target), "not_found": []}
+        log.info("    Lupa completada (voucher por voucher): %d/%d cargados, %d no encontrados",
+                 len(loaded), len(target), len(not_found))
+        return {"loaded": loaded, "not_found": not_found}
 
     # ── Modo chico (comportamiento original): matching contra el Excel ──
     try:
