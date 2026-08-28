@@ -55,12 +55,15 @@ class BrowserManager:
             raise RuntimeError("Browser not started. Call start() first.")
         return self._context
 
-    def screenshot(self, name: str = None) -> str:
+    def screenshot(self, name: str = None, timeout: float = 5000) -> str:
+        """`timeout` (ms) acota la espera de Playwright — sin esto, una página en estado
+        raro tras un Ctrl+C/interrupción puede colgar indefinidamente y bloquear todo el
+        cleanup posterior (guardado de reportes, cierre de navegador)."""
         self._screenshot_counter += 1
         filename = f"{name or 'screenshot'}_{self._screenshot_counter}.png"
         path = str(SCREENSHOT_DIR / filename)
         os.makedirs(SCREENSHOT_DIR, exist_ok=True)
-        self.page.screenshot(path=path, full_page=True)
+        self.page.screenshot(path=path, full_page=True, timeout=timeout)
         return path
 
     def close(self):

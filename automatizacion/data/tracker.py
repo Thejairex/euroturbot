@@ -366,6 +366,29 @@ class ProcessTracker:
             (filename,),
         )
 
+    def get_distinct_suppliers(self, filename: str, statuses: list[str]) -> list[str]:
+        """Códigos de proveedor distintos con al menos una fila en alguno de `statuses`."""
+        placeholders = ",".join(["%s"] * len(statuses))
+        rows = self._fetchall(
+            f"SELECT DISTINCT supplier_code FROM processed_rows "
+            f"WHERE filename = %s AND status IN ({placeholders}) "
+            f"AND supplier_code IS NOT NULL AND supplier_code <> '' "
+            f"ORDER BY supplier_code",
+            (filename, *statuses),
+        )
+        return [r["supplier_code"] for r in rows]
+
+    def get_row_indices_by_supplier(self, filename: str, supplier_code: str,
+                                     statuses: list[str]) -> list[int]:
+        """row_index de todas las filas de un proveedor en alguno de `statuses`."""
+        placeholders = ",".join(["%s"] * len(statuses))
+        rows = self._fetchall(
+            f"SELECT row_index FROM processed_rows "
+            f"WHERE filename = %s AND supplier_code = %s AND status IN ({placeholders})",
+            (filename, supplier_code, *statuses),
+        )
+        return [r["row_index"] for r in rows]
+
     def count_rows(self, filename: str) -> int:
         """Cantidad total de filas registradas para un archivo (cualquier estado)."""
         row = self._fetchone(
@@ -495,6 +518,27 @@ class ProcessTracker:
         )
         self._commit()
 
+    def mark_row_disabled(self, filename: str, row_index: int, error: str | None = None):
+        """Proveedor DELETED en TourplanNX (registro de solo lectura, INSERT nunca se
+        habilita) — terminal, no se reintenta (a diferencia de 'failed')."""
+        self._execute(
+            "UPDATE processed_rows SET status = 'disabled', processed_at = %s, error = %s "
+            "WHERE filename = %s AND row_index = %s",
+            (time.strftime("%Y-%m-%d %H:%M:%S"), error, filename, row_index),
+        )
+        self._commit()
+
+    def mark_rows_disabled_bulk(self, filename: str, row_indices: list[int], error: str | None = None):
+        if not row_indices:
+            return
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._executemany(
+            "UPDATE processed_rows SET status = 'disabled', processed_at = %s, error = %s "
+            "WHERE filename = %s AND row_index = %s",
+            [(now, error, filename, idx) for idx in row_indices],
+        )
+        self._commit()
+
     def mark_row_pending(self, filename: str, row_index: int):
         self._execute(
             "UPDATE processed_rows SET status = 'pending', error = NULL "
@@ -529,6 +573,30 @@ class ProcessTracker:
             "WHERE filename = %s AND status = 'skipped'",
             (filename,),
         )
+        self._commit()
+        return cur.rowcount
+
+    def reset_disabled_to_pending(self, filename: str | None = None) -> int:
+        """Vuelve a 'pending' las filas 'disabled' (proveedor DELETED en TourplanNX).
+
+        A diferencia de 'failed'/'skipped', esto NUNCA se hace automático al arrancar el
+        pipeline (es terminal a propósito, para no volver a perder horas reintentando
+        proveedores eliminados) — solo manual, vía este comando, para cuando un proveedor
+        deja de estar DELETED o se detectó por error.
+
+        `filename=None` resetea TODOS los archivos.
+        """
+        if filename:
+            cur = self._execute(
+                "UPDATE processed_rows SET status = 'pending', error = NULL "
+                "WHERE filename = %s AND status = 'disabled'",
+                (filename,),
+            )
+        else:
+            cur = self._execute(
+                "UPDATE processed_rows SET status = 'pending', error = NULL "
+                "WHERE status = 'disabled'"
+            )
         self._commit()
         return cur.rowcount
 
@@ -568,6 +636,21 @@ class ProcessTracker:
                 (filename, status),
             )
         return [dict(r) for r in rows]
+
+    def get_status_counts(self, filename: str | None = None) -> dict[str, int]:
+        """{status: cantidad} en un solo query (más barato que count_rows_by_status por
+        estado). Sin `filename`, agrega todos los archivos."""
+        if filename is None:
+            rows = self._fetchall(
+                "SELECT status, COUNT(*) AS cnt FROM processed_rows GROUP BY status"
+            )
+        else:
+            rows = self._fetchall(
+                "SELECT status, COUNT(*) AS cnt FROM processed_rows WHERE filename = %s "
+                "GROUP BY status",
+                (filename,),
+            )
+        return {r["status"]: r["cnt"] for r in rows}
 
     def count_rows_by_status(self, status: str, filename: str | None = None) -> int:
         """Cuenta las filas con un estatus dado (opcionalmente acotado a un archivo)."""

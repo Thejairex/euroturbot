@@ -61,7 +61,7 @@ def cmd_run(args) -> None:
     # Imports diferidos: solo el subcomando run necesita navegador/login.
     from core.browser import BrowserManager
     from core.session import SessionStore
-    from core.stats import StatsTracker
+    from core.stats import StatsTracker, StatsEventHandler
     from config.urls import spa_url
     from modules.login import do_login, is_logged_in
     from checks.cheque_pipeline import run_cheque_pipeline
@@ -76,6 +76,7 @@ def cmd_run(args) -> None:
 
     stats = StatsTracker()
     stats.start_run()
+    log.addHandler(StatsEventHandler(lambda: stats))
     browser = BrowserManager(headless=headless)
     tracker = None if args.no_tracker else ProcessTracker()
     store = SessionStore()
@@ -100,7 +101,21 @@ def cmd_run(args) -> None:
 
         run_cheque_pipeline(page, stats, tracker, test_config=test_config)
         log.info("Creación de cheques completada.")
+        stats.finished = True
+    except KeyboardInterrupt:
+        log.info("Interrupción por teclado")
+        stats.error = "Interrumpido por el usuario"
+        stats.finished = True
+    except Exception as e:
+        log.error("Error fatal: %s", e)
+        stats.error = str(e)
+        stats.finished = True
     finally:
+        try:
+            path = stats.save_summary_report(name="resumen_cheques", tracker=tracker)
+            log.info("Resumen de ejecución guardado en: %s", path)
+        except Exception:
+            pass
         try:
             browser.close()
         except Exception:

@@ -2,6 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Gobierno del proyecto (STATE, DECISIONS, TASKS)
+
+- Al iniciar una sesión:
+  - Leé STATE.md, DECISIONS.md y TASKS.md para entender el contexto.
+- Al terminar una sesión significativa (cambio importante, nueva decisión, tarea completada):
+  - Actualizá STATE.md y TASKS.md reflejando:
+    - Qué se hizo en esta sesión.
+    - Qué tareas cambiaron de estado.
+    - Cualquier nuevo bloqueo o decisión arquitectónica (si aplica, también actualizá DECISIONS.md).
+- No modifiques estos archivos sin motivo; usalos como fuente de verdad del estado del proyecto.
+
 ## Propósito
 
 Pipeline que lee pagos a proveedores desde Excel, hace login en TourplanNX, busca cada proveedor, navega a Accounting → Transactions, crea un transaction llenando Reference/Voucher/Currency, y sale del proveedor para la siguiente fila. Incluye un dashboard FastAPI (SSE) para arrancar, parar y monitorear desde el navegador.

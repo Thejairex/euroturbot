@@ -8,7 +8,10 @@ from utils.logger import log
 SEARCH_TIMEOUT = 30000
 
 
-def open_supplier(page: Page, supplier_code: str) -> None:
+def open_supplier(page: Page, supplier_code: str) -> bool:
+    """Abre el proveedor en Creditors. Devuelve True si el dropdown lo mostró marcado
+    'DELETED' (proveedor eliminado en TourplanNX — el registro completo, incluido
+    Transactions/INSERT, queda de solo lectura para siempre)."""
     code = supplier_code.strip()
     log.info("  Buscando proveedor: %s", code)
 
@@ -42,9 +45,12 @@ def open_supplier(page: Page, supplier_code: str) -> None:
     row = page.locator(".dropdown table tr").filter(has_text=code).first
     if not row.is_visible(timeout=3000):
         raise SupplierNotFoundError(f"Proveedor '{code}' no encontrado en TourplanNX")
+    row_text = row.inner_text()
+    is_deleted = "deleted" in row_text.lower()
     row.click()
 
     page.wait_for_load_state("networkidle")
     expect(page.get_by_role("button", name="Save")).to_be_visible(timeout=SEARCH_TIMEOUT)
     page.wait_for_timeout(1500)
-    log.info("  Proveedor abierto correctamente")
+    log.info("  Proveedor abierto correctamente%s", " (DELETED)" if is_deleted else "")
+    return is_deleted

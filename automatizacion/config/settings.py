@@ -79,12 +79,28 @@ VOUCHER_MAX_RANGE_WIDTH = 200_000
 # en profundidad. 0 = desactivado.
 VOUCHER_MAX_GAP = 50_000
 
+# Tope de chunks REALES (los que de verdad abren la lupa y tildan voucher-por-voucher,
+# no los que se saltan por 'ya existe en TourplanNX') que un proveedor puede consumir en
+# UNA corrida, sumando todas sus monedas. Sin esto, un proveedor monstruo (ej. 1EURO1,
+# 64k+ vouchers, cientos de chunks) puede tardar días con la selección voucher-por-voucher
+# y bloquear a todos los demás proveedores de la cola. Al alcanzar el tope, el resto de
+# ese proveedor queda 'pending' sin tocar y se retoma en la próxima corrida (no se pierde
+# nada, solo se reparte el tiempo entre todos). 0/None = sin límite.
+MAX_CHUNKS_PER_SUPPLIER_PER_RUN = 20
+
 # Filtro "Service Date To" del modal Select Vouchers (tab SELECTION). Acota la búsqueda
 # a vouchers con fecha de servicio <= esta fecha. None/"" = SIN filtro de fecha.
 # DESACTIVADO (rollback al sistema viejo, que no tenía este filtro): estaba fijo en una
 # fecha ya vencida (31/Mar/2026) y devolvía Found=0 al excluir los vouchers actuales.
 # Formato TourplanNX si se reactiva: 'DD/Mon/YYYY'.
 SERVICE_DATE_TO = None  # sin filtro de Service Date (como el sistema viejo)
+
+# Restringe qué filas se levantan para procesar esta corrida, por Service_Date (str
+# "YYYY-MM-DD", comparación lexicográfica sobre el string ISO del Excel). None/None = sin
+# restricción. Las filas fuera de rango quedan 'pending' intactas (no se marcan de ninguna
+# forma) — se recogen solas si el rango se amplía o se quita a futuro.
+PROCESS_SERVICE_DATE_FROM = None
+PROCESS_SERVICE_DATE_TO = None
 
 # Tolerancia del REMAINDER al guardar un invoice. Si |INVOICE - ESPERADO| la supera,
 # save_invoice es fail-closed: NO guarda. La tolerancia efectiva ESCALA con la cantidad de

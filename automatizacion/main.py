@@ -9,7 +9,7 @@ from core.browser import BrowserManager
 from core.grouping import export_grouped_csv
 from core.session import SessionStore
 from core.stats import StatsTracker, StatsEventHandler
-from core.pipeline import run_pipeline, get_sheet_names, INPUT_DIR
+from core.pipeline import run_pipeline, get_sheet_names, INPUT_DIR, scan_and_disable_deleted_suppliers
 from data.tracker import ProcessTracker
 from modules.login import do_login, is_logged_in
 from config.urls import spa_url
@@ -38,20 +38,30 @@ def reset_stop():
         _stop_event.clear()
 
 
-def _cleanup(stats: StatsTracker, browser: BrowserManager, error: str | None = None):
+def _cleanup(stats: StatsTracker, browser: BrowserManager, error: str | None = None,
+             tracker: ProcessTracker | None = None):
     if error:
         stats.error = error
         stats.finished = True
-        try:
-            browser.screenshot("error_fatal")
-        except Exception:
-            pass
     else:
         stats.finished = True
+    # Reportes PRIMERO, antes que nada que toque el browser: un Ctrl+C puede dejar la
+    # página en un estado colgado, y si el screenshot bloqueaba antes de esto, el
+    # resumen de ejecución nunca se llegaba a guardar (visto en producción).
     try:
         stats.save_report("report")
     except Exception:
         pass
+    try:
+        path = stats.save_summary_report(tracker=tracker)
+        log.info("Resumen de ejecución guardado en: %s", path)
+    except Exception:
+        pass
+    if error:
+        try:
+            browser.screenshot("error_fatal")
+        except Exception:
+            pass
 
 
 def _close_browser(browser: BrowserManager):
@@ -74,8 +84,9 @@ def _force_exit(stats: StatsTracker, code: int | None = None):
     os._exit(code)
 
 
-def _finish(browser: BrowserManager, stats: StatsTracker, error: str | None = None):
-    _cleanup(stats, browser, error)
+def _finish(browser: BrowserManager, stats: StatsTracker, error: str | None = None,
+            tracker: ProcessTracker | None = None):
+    _cleanup(stats, browser, error, tracker)
     t = threading.Thread(target=_close_browser, args=(browser,), daemon=True)
     t.start()
     t.join(timeout=15)
@@ -131,15 +142,15 @@ def run_automation(
 
     except KeyboardInterrupt:
         log.info("Interrupción por teclado")
-        _finish(browser, stats, "Interrumpido por el usuario")
+        _finish(browser, stats, "Interrumpido por el usuario", tracker)
         return
 
     except Exception as e:
         log.error("Error fatal: %s", e)
-        _finish(browser, stats, str(e))
+        _finish(browser, stats, str(e), tracker)
         return
 
-    _finish(browser, stats)
+    _finish(browser, stats, tracker=tracker)
 
 
 def run_pipeline_only(
@@ -188,15 +199,15 @@ def run_pipeline_only(
 
     except KeyboardInterrupt:
         log.info("Interrupción por teclado")
-        _finish(browser, stats, "Interrumpido por el usuario")
+        _finish(browser, stats, "Interrumpido por el usuario", tracker)
         return
 
     except Exception as e:
         log.error("Error fatal: %s", e)
-        _finish(browser, stats, str(e))
+        _finish(browser, stats, str(e), tracker)
         return
 
-    _finish(browser, stats)
+    _finish(browser, stats, tracker=tracker)
 
 
 def run_cheques_only(
@@ -252,15 +263,82 @@ def run_cheques_only(
 
     except KeyboardInterrupt:
         log.info("Interrupción por teclado")
-        _finish(browser, stats, "Interrumpido por el usuario")
+        _finish(browser, stats, "Interrumpido por el usuario", tracker)
         return
 
     except Exception as e:
         log.error("Error fatal: %s", e)
-        _finish(browser, stats, str(e))
+        _finish(browser, stats, str(e), tracker)
         return
 
-    _finish(browser, stats)
+    _finish(browser, stats, tracker=tracker)
+
+
+def run_scan_deleted(
+    stats: StatsTracker,
+    headless: bool = False,
+    file: str | None = None,
+    use_session: bool = True,
+    _browser: BrowserManager | None = None,
+    _stop_event: Event | None = None,
+):
+    """Escanea (sin facturar) los proveedores 'pending'/'failed' del archivo y marca
+    'disabled' a los que confirme como DELETED en TourplanNX. Ver
+    core.pipeline.scan_and_disable_deleted_suppliers. Requiere tracker (no tiene sentido
+    con --no-tracker: no hay nada que marcar)."""
+    stats.start_run()
+    browser = _browser if _browser is not None else BrowserManager(headless=headless)
+    stop_event = _stop_event if _stop_event is not None else _make_stop()
+    tracker = ProcessTracker()
+    store = SessionStore()
+
+    filepath = Path(file) if file else next(iter(sorted(INPUT_DIR.glob("*.xlsx"))), None)
+    if not filepath or not filepath.exists():
+        log.error("No se encontró archivo .xlsx para escanear. Usá --file <nombre>.")
+        _finish(browser, stats, "Archivo no encontrado", tracker)
+        return
+
+    try:
+        log.info("Iniciando escaneo de proveedores DELETED (headless=%s, archivo=%s)",
+                 headless, filepath.name)
+
+        if use_session and store.exists():
+            log.info("Restaurando sesión guardada...")
+            page = browser.start(storage_state=store.state_path(), init_script=store.init_script())
+        else:
+            page = browser.start()
+
+        log.info("Navegando a creditor...")
+        page.goto(spa_url("creditor"))
+        page.wait_for_load_state("networkidle")
+
+        if not is_logged_in(page):
+            log.info("Sesión expirada o no existe — haciendo login...")
+            do_login(page, stats)
+            page.goto(spa_url("creditor"))
+            page.wait_for_load_state("networkidle")
+        else:
+            log.info("Sesión activa — sin re-login.")
+
+        if use_session:
+            browser.save_session(store)
+            log.info("Sesión guardada en disco.")
+
+        result = scan_and_disable_deleted_suppliers(page, tracker, filepath.name, stats,
+                                                     stop_event=stop_event)
+        log.info("Escaneo completado: %s", result)
+
+    except KeyboardInterrupt:
+        log.info("Interrupción por teclado")
+        _finish(browser, stats, "Interrumpido por el usuario", tracker)
+        return
+
+    except Exception as e:
+        log.error("Error fatal: %s", e)
+        _finish(browser, stats, str(e), tracker)
+        return
+
+    _finish(browser, stats, tracker=tracker)
 
 
 class RunManager:
@@ -429,13 +507,16 @@ def parse_args():
     parser.add_argument("--row", type=int, help="Fila específica a procesar (0-indexed)")
     parser.add_argument("--sheet", type=str, default=None, help="Nombre de la hoja (default: auto-detect)")
     parser.add_argument("--no-tracker", action="store_true", help="Desactivar tracker (procesa siempre)")
-    parser.add_argument("--tracker", type=str, choices=["status", "reset", "backfill-references"],
+    parser.add_argument("--tracker", type=str,
+                        choices=["status", "reset", "backfill-references", "reset-disabled"],
                         help="Gestión del tracker")
     parser.add_argument("--file", type=str, help="Archivo para --tracker reset")
     parser.add_argument("--dry-run", action="store_true",
                         help="Con --tracker backfill-references: solo contar, sin modificar")
     parser.add_argument("--all", action="store_true", help="Resetear todo el tracker")
     parser.add_argument("--export-csv", action="store_true", help="Exportar CSV agrupado por proveedor (sin abrir navegador)")
+    parser.add_argument("--scan-deleted", action="store_true",
+                        help="Escanea proveedores pending/failed y marca 'disabled' los que estén DELETED en TourplanNX (sin facturar)")
     parser.add_argument("--fresh-login", action="store_true", help="Ignorar sesión guardada y hacer login desde cero")
     parser.add_argument("--clear-session", action="store_true", help="Borrar la sesión guardada en disco y salir")
     parser.add_argument("--supplier", type=str, help="Procesar solo el proveedor con este Supplier_Code (para testing masivo)")
@@ -463,6 +544,15 @@ def main():
         print(f"Resumen:  {summary}")
         sys.exit(0)
 
+    if args.scan_deleted:
+        headless = args.headless
+        if args.visible:
+            headless = False
+        stats = StatsTracker()
+        log.addHandler(StatsEventHandler(lambda: stats))
+        run_scan_deleted(stats, headless=headless, file=args.file)
+        sys.exit(1 if stats.error else 0)
+
     if args.tracker:
         tracker = ProcessTracker()
         if args.tracker == "status":
@@ -479,6 +569,15 @@ def main():
         elif args.tracker == "backfill-references":
             result = tracker.backfill_voucher_references(dry_run=args.dry_run)
             print(result)
+        elif args.tracker == "reset-disabled":
+            if args.all:
+                n = tracker.reset_disabled_to_pending()
+                print(f"{n} fila(s) 'disabled' → 'pending' en TODOS los archivos.")
+            elif args.file:
+                n = tracker.reset_disabled_to_pending(args.file)
+                print(f"{n} fila(s) 'disabled' → 'pending' para: {args.file}")
+            else:
+                print("Usá --file <nombre> o --all")
         return
 
     headless = args.headless
@@ -503,6 +602,10 @@ def main():
         log.info("--fresh-login: sesión anterior borrada.")
 
     stats = StatsTracker()
+    # CLI directa (sin RunManager/monitor): sin esto, la sección de "últimos eventos" del
+    # resumen de ejecución queda vacía (el handler que ya existe apunta al stats del
+    # RunManager singleton, que solo se activa vía el monitor web).
+    log.addHandler(StatsEventHandler(lambda: stats))
     run_automation(stats, headless=headless, test_config=test_config, no_tracker=args.no_tracker, use_session=use_session, limit=args.limit, max_vouchers=args.max_vouchers)
 
     sys.exit(1 if stats.error else 0)

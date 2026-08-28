@@ -38,6 +38,7 @@ class StatsTracker:
         self._skipped: list[dict] = []
         self._vouchers: deque = deque(maxlen=1000)
         self._voucher_seq: int = 0
+        self._total_planned: int | None = None
 
     @property
     def finished(self) -> bool:
@@ -72,12 +73,22 @@ class StatsTracker:
             self._skipped = []
             self._vouchers.clear()
             self._voucher_seq = 0
+            self._total_planned = None
 
     def add_step(self, name: str) -> StepStats:
         step = StepStats(name=name)
         with self._lock:
             self._steps.append(step)
         return step
+
+    def set_total_planned(self, n: int) -> None:
+        """Total real de proveedores a procesar en esta corrida. `add_step` se llama de a
+        uno a medida que el loop los alcanza, así que `len(self._steps)` NO refleja el
+        total hasta que la corrida termine — sin esto, un reporte a mitad de una corrida
+        larga muestra "1/2 proveedores" cuando en realidad son "1/302" (confuso: parece que
+        la corrida entera tenía solo 2 proveedores, no que se cortó a mitad de 302)."""
+        with self._lock:
+            self._total_planned = n
 
     def mark_running(self, step: StepStats):
         with self._lock:
@@ -176,6 +187,7 @@ class StatsTracker:
                 "finished": self._finished,
                 "error": self._error,
                 "total": total,
+                "total_planned": self._total_planned,
                 "ok": ok,
                 "failed": failed,
                 "skipped": skipped,
@@ -199,6 +211,63 @@ class StatsTracker:
         path = Path(REPORT_DIR) / f"{name}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self.results, indent=2, ensure_ascii=False), encoding="utf-8")
+        return str(path)
+
+    def save_summary_report(self, name: str = "resumen_ejecucion", tracker=None) -> str:
+        """Reporte LEGIBLE (Markdown) de la corrida: qué hizo, qué falló, en qué se quedó
+        si se cortó a mitad, y el estado acumulado del tracker (todas las corridas, no
+        solo esta). Pensado para revisar sin tener que consultar el log crudo.
+
+        Se llama desde _cleanup/_finish en main.py — corre en todos los caminos de
+        salida que pasan por código Python (fin normal, Ctrl+C, excepción, force-stop
+        del monitor). Un kill duro del proceso (taskkill /F, cierre de la ventana,
+        corte de luz) no puede interceptarse en ningún lenguaje — en ese caso no hay
+        reporte de esta corrida, solo el de la corrida anterior que sí cerró bien."""
+        r = self.results
+        lines = [
+            f"# Resumen de ejecución — {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            f"**Estado final:** {'ERROR: ' + r['error'] if r['error'] else ('OK' if r['finished'] else 'INTERRUMPIDO')}",
+            f"**Duración:** {r['elapsed_seconds']:.0f}s",
+            (f"**Progreso:** proveedor {r['total']}/{r['total_planned']} de la corrida "
+             f"({r['ok']} terminado(s) sin excepción, {r['failed']} con excepción, {r['skipped']} salteado(s))"
+             if r.get("total_planned") else
+             f"**Progreso:** {r['progress_pct']}% ({r['ok'] + r['failed'] + r['skipped']}/{r['total']} proveedores)"),
+            "",
+            "## Esta corrida",
+            f"- OK: {r['ok']}",
+            f"- Failed: {r['failed']}",
+            f"- Skipped: {r['skipped']}",
+        ]
+
+        if r["activity"]:
+            lines += ["", "## Última actividad conocida",
+                      "(dónde se quedó si la corrida se cortó a mitad de un proveedor)", ""]
+            lines += [f"- {k}: {v}" for k, v in r["activity"].items()]
+
+        fallidos = [s for s in r["steps"] if s["status"] == "failed"]
+        if fallidos:
+            lines += ["", "## Proveedores con error en esta corrida", ""]
+            lines += [f"- {s['name']}: {s['error']} ({s['duration']}s)" for s in fallidos]
+
+        if tracker is not None:
+            try:
+                counts = tracker.get_status_counts()
+                lines += ["", "## Estado acumulado del tracker (todos los archivos)", ""]
+                for status in ("ok", "pending", "failed", "skipped", "disabled", "processing"):
+                    if status in counts:
+                        lines.append(f"- {status}: {counts[status]}")
+            except Exception as e:
+                lines += ["", f"(No se pudo leer el estado del tracker: {e})"]
+
+        eventos = list(self._events)[-30:]
+        if eventos:
+            lines += ["", "## Últimos eventos del log", ""]
+            lines += [f"- [{e['ts']}] {e['level']}: {e['message']}" for e in eventos]
+
+        path = Path(REPORT_DIR) / f"{name}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return str(path)
 
 

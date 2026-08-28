@@ -49,7 +49,7 @@ def _load_cheque_priority_ranks() -> dict[str, int]:
         return {}
 
 
-def _load_exempt_suppliers() -> set[str]:
+def load_exempt_suppliers() -> set[str]:
     """Lee proveedores_exentos.csv → set de Supplier_Code (uppercase). Vacío si no existe."""
     try:
         text = CHEQUE_EXEMPT_FILE.read_text(encoding="utf-8-sig")
@@ -71,6 +71,38 @@ def _plan_from_tracker(tracker: ProcessTracker) -> dict:
         if cur not in cur_map or ri < cur_map[cur]:
             cur_map[cur] = ri
     return plan
+
+
+def emit_cheque_for_currency(page, tracker: ProcessTracker | None, supplier_code: str,
+                             currency: str, row_index: int, due, total: float) -> str:
+    """Emite (o reintenta) el cheque de supplier_code/currency si no hay uno 'ok' ya
+    (idempotente vía tracker.is_cheque_done). Asume la página ya posicionada en
+    Transactions de ese proveedor (sin ningún modal abierto). Devuelve 'ok' | 'skipped' | 'failed'."""
+    if tracker and tracker.is_cheque_done(supplier_code, currency):
+        log.info("  %s/%s ya tiene cheque ok — skip (idempotencia)", supplier_code, currency)
+        return "skipped"
+    reference = f"{CHEQUE_REFERENCE_PREFIX}{row_index}{supplier_code}"
+    invoice_reference = f"INV{row_index}{supplier_code}"
+    try:
+        found = create_cheque(page, supplier_code, currency, reference, total, due,
+                              CHEQUE_PAYMENT_TYPE)
+        if tracker:
+            if found and found > 0:
+                tracker.mark_cheque_ok(supplier_code, currency, reference, due,
+                                       invoice_reference=invoice_reference)
+                return "ok"
+            tracker.mark_cheque_failed(
+                supplier_code, currency, reference,
+                "Select Invoice Lines sin invoices (FOUND=0)", due,
+                invoice_reference=invoice_reference)
+            return "failed"
+    except Exception as e:
+        log.error("  Cheque %s/%s FAILED: %s", supplier_code, currency, e)
+        if tracker:
+            tracker.mark_cheque_failed(supplier_code, currency, reference, str(e), due,
+                                       invoice_reference=invoice_reference)
+        return "failed"
+    return "failed"
 
 
 def run_cheque_pipeline(page, stats, tracker: ProcessTracker | None = None,
@@ -99,7 +131,7 @@ def run_cheque_pipeline(page, stats, tracker: ProcessTracker | None = None,
         plan = {s: c for s, c in plan.items() if s == supplier_filter}
         plan.setdefault(supplier_filter, {})
 
-    exempt = _load_exempt_suppliers()
+    exempt = load_exempt_suppliers()
     if exempt:
         skipped = [s for s in plan if s.upper() in exempt]
         for s in skipped:
@@ -140,39 +172,14 @@ def run_cheque_pipeline(page, stats, tracker: ProcessTracker | None = None,
                     log.warning("  %s: moneda %s sin invoices en la grilla — skip",
                                 supplier_code, currency)
                     continue
-                if tracker and tracker.is_cheque_done(supplier_code, currency):
-                    log.info("  %s/%s ya tiene cheque ok — skip (idempotencia)",
-                             supplier_code, currency)
-                    continue
-
                 # row_index para la REFERENCE: el más bajo de la moneda (tracker) o, en
                 # modo grilla sin tracker, el índice de enumeración (único por moneda
                 # para que ARS y USD no colisionen en OP{row_index}{code}).
                 row_index = currency_rows.get(currency, i)
-                reference = f"{CHEQUE_REFERENCE_PREFIX}{row_index}{supplier_code}"
-                invoice_reference = f"INV{row_index}{supplier_code}"
-                due = summary[currency]["date"]
-                total = summary[currency]["total"]
-                try:
-                    found = create_cheque(page, supplier_code, currency, reference, total, due,
-                                          CHEQUE_PAYMENT_TYPE)
-                    if tracker:
-                        if found and found > 0:
-                            tracker.mark_cheque_ok(supplier_code, currency, reference, due,
-                                                  invoice_reference=invoice_reference)
-                        else:
-                            # create_cheque devolvió 0 (modal sin invoices, abortado): NO es
-                            # éxito — marcarlo failed para que no quede falsamente 'ok' y la
-                            # idempotencia lo reintente.
-                            tracker.mark_cheque_failed(
-                                supplier_code, currency, reference,
-                                "Select Invoice Lines sin invoices (FOUND=0)", due,
-                                invoice_reference=invoice_reference)
-                except Exception as e:
-                    log.error("  Cheque %s/%s FAILED: %s", supplier_code, currency, e)
-                    if tracker:
-                        tracker.mark_cheque_failed(supplier_code, currency, reference, str(e), due,
-                                                  invoice_reference=invoice_reference)
+                emit_cheque_for_currency(
+                    page, tracker, supplier_code, currency, row_index,
+                    due=summary[currency]["date"], total=summary[currency]["total"],
+                )
 
             exit_supplier(page)
 

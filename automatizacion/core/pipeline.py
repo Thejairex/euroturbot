@@ -11,13 +11,18 @@ from config.settings import (
     BASE_DIR,
     MAX_VOUCHERS_PER_SUPPLIER,
     MAX_VOUCHERS_DEFER_THRESHOLD,
+    MAX_CHUNKS_PER_SUPPLIER_PER_RUN,
     PRIORITY_FILE,
+    PROCESS_SERVICE_DATE_FROM,
+    PROCESS_SERVICE_DATE_TO,
     READ_EXISTING_REFS,
     VOUCHER_CHUNK_SIZE,
     VOUCHER_MAX_RANGE_WIDTH,
     VOUCHER_MAX_GAP,
 )
 from config.urls import spa_url
+from checks.cheque_creator import read_invoice_summary_by_currency
+from checks.cheque_pipeline import emit_cheque_for_currency, load_exempt_suppliers
 from core.exceptions import SupplierNotFoundError
 from core.grouping import group_rows_by_supplier, write_skipped_report, write_oversized_report
 from data.tracker import ProcessTracker
@@ -452,7 +457,7 @@ def get_data_rows(filepath: Path, sheet_name: str | None = None) -> list[dict]:
     # headers, (2) lectura completa pero SOLO de las 5 columnas necesarias (usecols) → ~5x
     # menos memoria y más rápido.
     needed = ["Supplier_Code", "Supplier_Name", "Voucher_Number",
-              "Service_Cost_Currency", "ProductCost"]
+              "Service_Cost_Currency", "ProductCost", "Service_Date"]
     head = pd.read_excel(filepath, sheet_name=sheet_name, dtype=str, header=None, nrows=10)
     if len(head) < 1:
         return []
@@ -499,7 +504,86 @@ def get_sheet_names(filepath: Path) -> list[str]:
     return [s for s in sheets if s not in ("Sheet2",)]
 
 
-def process_row(page, row: dict, row_index: int, filename: str, tracker: ProcessTracker | None, stats, stop_event: Event | None = None):
+def _insert_disabled(page) -> bool:
+    """Confirma en el DOM si el botón INSERT de Transactions está deshabilitado. Un
+    proveedor DELETED en TourplanNX deja el registro entero de solo lectura para siempre
+    (INSERT nunca se habilita) — ver open_supplier."""
+    try:
+        return page.locator("#creditorview").get_by_role("button", name="INSERT").is_disabled(timeout=3000)
+    except Exception:
+        return False
+
+
+def scan_and_disable_deleted_suppliers(page, tracker: ProcessTracker, filename: str, stats,
+                                       stop_event: Event | None = None) -> dict:
+    """Recorre los proveedores en 'pending'/'failed' de `filename` SIN facturar — solo abre
+    cada uno, confirma si está DELETED en TourplanNX (mismo chequeo que process_supplier_group:
+    nombre 'DELETED' + INSERT confirmado deshabilitado) y, si es así, marca TODAS sus filas
+    pending/failed como 'disabled' de una sola vez.
+
+    Mucho más rápido que dejar que el pipeline normal los descubra uno por uno vía timeouts
+    de 30s en INSERT por cada chunk/fila — acá es un solo open_supplier+navigate (~5-8s) por
+    proveedor, sin intentar ningún INSERT real.
+
+    Devuelve {"scanned": int, "suppliers_disabled": int, "rows_disabled": int}.
+    """
+    suppliers = tracker.get_distinct_suppliers(filename, ["pending", "failed"])
+    log.info("Escaneo DELETED: %d proveedor(es) a revisar", len(suppliers))
+
+    scanned = 0
+    suppliers_disabled = 0
+    rows_disabled = 0
+
+    for supplier_code in suppliers:
+        if stop_event and stop_event.is_set():
+            log.info("Escaneo DELETED detenido por usuario")
+            break
+        scanned += 1
+        stats.set_activity(supplier=supplier_code)
+        try:
+            is_deleted = open_supplier(page, supplier_code)
+            navigate_to_transactions(page)
+            if is_deleted and _insert_disabled(page):
+                indices = tracker.get_row_indices_by_supplier(filename, supplier_code,
+                                                               ["pending", "failed"])
+                tracker.mark_rows_disabled_bulk(filename, indices, "Proveedor DELETED en TourplanNX")
+                suppliers_disabled += 1
+                rows_disabled += len(indices)
+                log.info("  %s: DELETED confirmado — %d filas → disabled", supplier_code, len(indices))
+            exit_supplier(page)
+        except SupplierNotFoundError as e:
+            log.warning("  %s no encontrado en TourplanNX — sin cambios (%s)", supplier_code, e)
+        except Exception as e:
+            log.error("  %s: error durante el escaneo: %s", supplier_code, e)
+            # Hard recovery: cerrar modales, salir y recargar la SPA (mismo patrón que
+            # run_cheque_pipeline) para no perder el resto del escaneo por un cuelgue puntual.
+            try:
+                abort_transaction(page)
+            except Exception:
+                pass
+            try:
+                exit_supplier(page)
+            except Exception:
+                pass
+            try:
+                page.goto(spa_url("creditor"))
+                page.reload(wait_until="networkidle")
+                page.wait_for_load_state("networkidle", timeout=15000)
+                ensure_logged_in(page, stats)
+            except Exception:
+                pass
+
+        if scanned % 25 == 0:
+            log.info("  Progreso escaneo: %d/%d proveedores (%d DELETED hasta ahora)",
+                     scanned, len(suppliers), suppliers_disabled)
+
+    log.info("Escaneo DELETED finalizado: %d proveedores revisados, %d confirmados DELETED (%d filas → disabled)",
+             scanned, suppliers_disabled, rows_disabled)
+    return {"scanned": scanned, "suppliers_disabled": suppliers_disabled, "rows_disabled": rows_disabled}
+
+
+def process_row(page, row: dict, row_index: int, filename: str, tracker: ProcessTracker | None, stats,
+                stop_event: Event | None = None, exempt_suppliers: set[str] | None = None):
     """Procesa un único registro. Se usa cuando el proveedor tiene solo 1 voucher."""
     supplier_code = (row.get("Supplier_Code") or "").strip()
     voucher = row.get("Voucher_Number", "?")
@@ -514,12 +598,36 @@ def process_row(page, row: dict, row_index: int, filename: str, tracker: Process
         tracker.mark_row_processing(filename, row_index)
 
     try:
-        open_supplier(page, supplier_code)
+        is_deleted = open_supplier(page, supplier_code)
         navigate_to_transactions(page)
+        if is_deleted and _insert_disabled(page):
+            log.warning("  Fila %d DISABLED: proveedor %s está DELETED en TourplanNX (INSERT "
+                        "confirmado deshabilitado) — no se reintenta", row_index, supplier_code)
+            if tracker:
+                tracker.mark_row_disabled(filename, row_index, "Proveedor DELETED en TourplanNX")
+            stats.add_voucher_result({
+                "filename": filename, "supplier_code": supplier_code,
+                "voucher": str(voucher), "currency": row.get("Service_Cost_Currency", ""),
+                "status": "disabled", "error": "Proveedor DELETED en TourplanNX", "row_index": row_index,
+            })
+            exit_supplier(page)
+            return
         page.locator("#creditorview").get_by_role("button", name="INSERT").click()
         create_transaction(page, row, row_index)
         page.get_by_role("dialog").get_by_role("button", name="EXIT").click()
         page.get_by_role("dialog").wait_for(state="hidden", timeout=5000)
+
+        # Cheque inline (mismo criterio que process_supplier_group): antes de salir del
+        # proveedor, mientras seguimos parados en Transactions.
+        currency = (row.get("Service_Cost_Currency") or "").strip()
+        if currency and (not exempt_suppliers or supplier_code.strip().upper() not in exempt_suppliers):
+            summary = read_invoice_summary_by_currency(page)
+            if currency in summary:
+                emit_cheque_for_currency(
+                    page, tracker, supplier_code, currency, row_index=row_index,
+                    due=summary[currency]["date"], total=summary[currency]["total"],
+                )
+
         exit_supplier(page)
         if tracker:
             tracker.mark_row_ok(filename, row_index)
@@ -560,6 +668,7 @@ def process_supplier_group(
     stop_event: Event | None = None,
     max_vouchers: int | None = None,
     oversized_report: list | None = None,
+    exempt_suppliers: set[str] | None = None,
 ):
     """Procesa todos los vouchers de un proveedor en un solo ciclo de navegación."""
     supplier_code = group["supplier_code"]
@@ -603,7 +712,8 @@ def process_supplier_group(
 
     if group["size"] == 1:
         rec = records[0]
-        process_row(page, rows[rec["row_index"]], rec["row_index"], filename, tracker, stats, stop_event=stop_event)
+        process_row(page, rows[rec["row_index"]], rec["row_index"], filename, tracker, stats,
+                   stop_event=stop_event, exempt_suppliers=exempt_suppliers)
         return
 
     if not group["total_by_currency"]:
@@ -626,10 +736,22 @@ def process_supplier_group(
     group_timeout = False
     per_row_status: dict[int, str] = {}
     per_row_error: dict[int, str] = {}  # motivo específico por fila failed (para el tracker)
+    # Cuenta solo chunks REALES (_cargar_chunk_factura); los que se saltean por 'ya existe
+    # en TourplanNX' son casi gratis y no cuentan contra el tope.
+    chunks_this_supplier = 0
+    budget_exhausted = False
 
     try:
-        open_supplier(page, supplier_code)
+        is_deleted = open_supplier(page, supplier_code)
         navigate_to_transactions(page)
+
+        if is_deleted and _insert_disabled(page):
+            log.warning("  Proveedor %s DISABLED: DELETED en TourplanNX (INSERT confirmado "
+                        "deshabilitado) — %d filas, no se reintentan", supplier_code, len(all_indices))
+            if tracker:
+                tracker.mark_rows_disabled_bulk(filename, all_indices, "Proveedor DELETED en TourplanNX")
+            exit_supplier(page)
+            return
 
         # Leer referencias INV* ya existentes en TourplanNX para este proveedor.
         # Se corre para TODOS los proveedores (masivos y no-masivos) para prevenir el
@@ -645,6 +767,12 @@ def process_supplier_group(
                     pass
                 raise PipelineStopped()
 
+            if budget_exhausted:
+                log.warning("  Proveedor %s: tope de %d chunks/corrida alcanzado — moneda %s "
+                            "queda pending para la próxima corrida", supplier_code,
+                            MAX_CHUNKS_PER_SUPPLIER_PER_RUN, currency)
+                continue
+
             records_for_currency = [rec for rec in records if rec["currency"] == currency]
 
             # ── Modo CHUNKED (proveedores masivos): varias facturas, SELECT ALL por chunk ──
@@ -657,6 +785,14 @@ def process_supplier_group(
                 for ci, chunk in enumerate(chunks, 1):
                     if stop_event and stop_event.is_set():
                         raise PipelineStopped()
+                    if (MAX_CHUNKS_PER_SUPPLIER_PER_RUN
+                            and chunks_this_supplier >= MAX_CHUNKS_PER_SUPPLIER_PER_RUN):
+                        log.warning("    Tope de %d chunks/corrida alcanzado a mitad de %s — "
+                                    "quedan %d chunks (%s) para la próxima corrida",
+                                    MAX_CHUNKS_PER_SUPPLIER_PER_RUN, currency,
+                                    len(chunks) - ci + 1, currency)
+                        budget_exhausted = True
+                        break
                     chunk_ref = f"INV{chunk['records'][0]['row_index']}{supplier_code}"
                     chunk_indices = [r["row_index"] for r in chunk["records"]]
                     log.info("  [DEBUG] Chunk %d/%d ref=%s — existentes: %s",
@@ -692,6 +828,7 @@ def process_supplier_group(
                     ok_idx, failed_idx, skipped_idx, fail_reason = _cargar_chunk_factura(
                         page, supplier_code, currency, chunk["records"], select_all=True,
                         tracker=tracker, filename=filename)
+                    chunks_this_supplier += 1
                     for idx in ok_idx:
                         per_row_status[idx] = "ok"
                         stats.add_voucher_result({
@@ -713,6 +850,22 @@ def process_supplier_group(
                             per_row_error[idx] = fail_reason
                         group_ok = False
                         group_error = group_error or f"Chunk fallido ({currency})"
+
+                # Cheque inline: emitir el de esta moneda ahora que sus facturas están
+                # guardadas, en la MISMA sesión (sin reabrir el proveedor después). Solo
+                # por lo que realmente quedó 'ok' — si hubo fallas parciales, el total
+                # leído de la grilla ya refleja nada más que lo efectivamente guardado.
+                if not exempt_suppliers or supplier_code.strip().upper() not in exempt_suppliers:
+                    ok_idx_currency = [r["row_index"] for r in records_for_currency
+                                       if per_row_status.get(r["row_index"]) == "ok"]
+                    if ok_idx_currency:
+                        summary = read_invoice_summary_by_currency(page)
+                        if currency in summary:
+                            emit_cheque_for_currency(
+                                page, tracker, supplier_code, currency,
+                                row_index=min(ok_idx_currency),
+                                due=summary[currency]["date"], total=summary[currency]["total"],
+                            )
                 continue
 
             # ── Modo chico (original, una sola factura, matching contra el Excel) ──
@@ -1078,6 +1231,22 @@ def run_pipeline(
             else:
                 pending_rows = pending_rows[:1]
 
+        if PROCESS_SERVICE_DATE_FROM or PROCESS_SERVICE_DATE_TO:
+            antes = len(pending_rows)
+            def _en_rango(idx):
+                sd = (rows[idx].get("Service_Date") or "")[:10]  # "YYYY-MM-DD"
+                if not sd:
+                    return False
+                if PROCESS_SERVICE_DATE_FROM and sd < PROCESS_SERVICE_DATE_FROM:
+                    return False
+                if PROCESS_SERVICE_DATE_TO and sd > PROCESS_SERVICE_DATE_TO:
+                    return False
+                return True
+            pending_rows = [r for r in pending_rows if _en_rango(r["row_index"])]
+            log.info("  Filtro Service_Date [%s .. %s]: %d/%d filas pending entran en rango "
+                     "(resto queda pending sin tocar)",
+                     PROCESS_SERVICE_DATE_FROM, PROCESS_SERVICE_DATE_TO, len(pending_rows), antes)
+
         total = len(pending_rows)
         pending_indices = [r["row_index"] for r in pending_rows]
         groups = group_rows_by_supplier(rows, pending_indices)
@@ -1098,6 +1267,11 @@ def run_pipeline(
             log.info("  Lote: procesando %d de %d proveedores pendientes", limit, len(groups))
             groups = groups[:limit]
 
+        # Cheque inline: cargado una sola vez por corrida (no por proveedor).
+        exempt_suppliers = load_exempt_suppliers()
+
+        stats.set_total_planned(len(groups))
+
         pipeline_stopped = False
         for i, group in enumerate(groups, 1):
             if stop_event and stop_event.is_set():
@@ -1111,7 +1285,8 @@ def run_pipeline(
             try:
                 process_supplier_group(page, group, rows, filename, tracker, stats, skipped_report,
                                        stop_event=stop_event, max_vouchers=effective_max,
-                                       oversized_report=oversized_report)
+                                       oversized_report=oversized_report,
+                                       exempt_suppliers=exempt_suppliers)
                 stats.mark_ok(step)
             except PipelineStopped:
                 stats.mark_skipped(step)
