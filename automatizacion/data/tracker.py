@@ -547,6 +547,19 @@ class ProcessTracker:
         )
         self._commit()
 
+    def mark_rows_pending_bulk(self, filename: str, row_indices: list[int]):
+        """Para filas que quedaron sin intentar por una razón NO error (ej. tope de
+        MAX_CHUNKS_PER_SUPPLIER_PER_RUN alcanzado a mitad de un proveedor) — vuelven a
+        'pending' explícitamente en vez de caer en 'failed' por default."""
+        if not row_indices:
+            return
+        self._executemany(
+            "UPDATE processed_rows SET status = 'pending', error = NULL "
+            "WHERE filename = %s AND row_index = %s",
+            [(filename, idx) for idx in row_indices],
+        )
+        self._commit()
+
     def reset_processing_to_pending(self, filename: str) -> int:
         cur = self._execute(
             "UPDATE processed_rows SET status = 'pending' "

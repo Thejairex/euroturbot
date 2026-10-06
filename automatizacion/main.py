@@ -102,6 +102,7 @@ def run_automation(
     use_session: bool = True,
     limit: int | None = None,
     max_vouchers: int | None = None,
+    only_file: str | None = None,
     _browser: BrowserManager | None = None,
     _stop_event: Event | None = None,
 ):
@@ -136,7 +137,7 @@ def run_automation(
             browser.save_session(store)
             log.info("Sesión guardada en disco.")
 
-        run_pipeline(page, stats, tracker, stop_event=stop_event, test_config=test_config, no_tracker=no_tracker, limit=limit, max_vouchers=max_vouchers)
+        run_pipeline(page, stats, tracker, stop_event=stop_event, test_config=test_config, no_tracker=no_tracker, limit=limit, max_vouchers=max_vouchers, only_file=only_file)
 
         log.info("Automatización completada. Progreso: %s%%", stats.progress)
 
@@ -510,7 +511,7 @@ def parse_args():
     parser.add_argument("--tracker", type=str,
                         choices=["status", "reset", "backfill-references", "reset-disabled"],
                         help="Gestión del tracker")
-    parser.add_argument("--file", type=str, help="Archivo para --tracker reset")
+    parser.add_argument("--file", type=str, help="Archivo para --tracker reset, o para elegir cuál probar con --test (default: el primero alfabéticamente en input/)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Con --tracker backfill-references: solo contar, sin modificar")
     parser.add_argument("--all", action="store_true", help="Resetear todo el tracker")
@@ -606,7 +607,8 @@ def main():
     # resumen de ejecución queda vacía (el handler que ya existe apunta al stats del
     # RunManager singleton, que solo se activa vía el monitor web).
     log.addHandler(StatsEventHandler(lambda: stats))
-    run_automation(stats, headless=headless, test_config=test_config, no_tracker=args.no_tracker, use_session=use_session, limit=args.limit, max_vouchers=args.max_vouchers)
+    only_file = args.file if args.test else None
+    run_automation(stats, headless=headless, test_config=test_config, no_tracker=args.no_tracker, use_session=use_session, limit=args.limit, max_vouchers=args.max_vouchers, only_file=only_file)
 
     sys.exit(1 if stats.error else 0)
 

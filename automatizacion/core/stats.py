@@ -36,6 +36,7 @@ class StatsTracker:
         self._events: deque = deque(maxlen=200)
         self._event_seq: int = 0
         self._skipped: list[dict] = []
+        self._reactivated: list[dict] = []
         self._vouchers: deque = deque(maxlen=1000)
         self._voucher_seq: int = 0
         self._total_planned: int | None = None
@@ -71,6 +72,7 @@ class StatsTracker:
             self._events.clear()
             self._event_seq = 0
             self._skipped = []
+            self._reactivated = []
             self._vouchers.clear()
             self._voucher_seq = 0
             self._total_planned = None
@@ -142,6 +144,10 @@ class StatsTracker:
     def add_skipped(self, entry: dict) -> None:
         with self._lock:
             self._skipped.append(entry)
+
+    def add_reactivated(self, entry: dict) -> None:
+        with self._lock:
+            self._reactivated.append(entry)
 
     def events_after(self, seq: int) -> list[dict]:
         with self._lock:
@@ -259,6 +265,11 @@ class StatsTracker:
                         lines.append(f"- {status}: {counts[status]}")
             except Exception as e:
                 lines += ["", f"(No se pudo leer el estado del tracker: {e})"]
+
+        if self._reactivated:
+            lines += ["", "## Proveedores reactivados automáticamente en esta corrida", ""]
+            lines += [f"- {e['supplier_code']} (fila {e['row_index']}, archivo {e['filename']})"
+                      for e in self._reactivated]
 
         eventos = list(self._events)[-30:]
         if eventos:

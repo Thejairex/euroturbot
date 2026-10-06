@@ -27,7 +27,6 @@ from modules.transaction_creator import (
     fill_currency,
     abort_transaction,
     MODAL_TIMEOUT,
-    SAVE_TIMEOUT_MS,
 )
 from utils.logger import log
 
@@ -44,64 +43,266 @@ SELECT_ALL = "button.tpselectall"
 SEARCH_BTN = "button.tpsearch"
 
 
-def _wait_for_transactions_grid(page: Page, timeout_ms: int = 15000) -> int:
-    """Espera a que la grilla de Transactions pinte filas (carga async tras navegar).
+class ReferenceExistsError(Exception):
+    """La REFERENCE del cheque ya existe en TourplanNX (Error 1038 Transaction error,
+    Reference Exists) — create_cheque la captura y reintenta con otra referencia."""
 
-    navigate_to_transactions solo espera 500ms fijos; la grilla del servidor puede
-    tardar más y se leía vacía, saltando invoices que sí existían. Polling de filas
-    tr.tpgrid; si tras el timeout no hay ninguna, se asume grilla genuinamente vacía y
-    el caller sigue (no rompe)."""
+
+# SAVE_TIMEOUT_MS (120s, de modules/transaction_creator.py) alcanza para los chunks de
+# ~200 vouchers del pipeline de invoices, pero no para cheques con selecciones enormes
+# — confirmado en vivo (2026-09-30, 1ING01): 21.555 invoices seleccionados, SAVE seguía
+# procesando pasados los 120s. Constante propia, no se toca la compartida (no vale la
+# pena hacer esperar 10min a un invoice normal que realmente falló).
+CHEQUE_SAVE_TIMEOUT_MS = 600000
+
+
+def _open_transaction_filters(page: Page, attempts: int = 4, per_attempt_ms: int = 1500) -> bool:
+    """Expande el panel 'Transaction Filters' de la grilla de Transactions si está
+    colapsado (así viene tras navigate_to_transactions). Idempotente: si ya está
+    expandido (clase 'tpexpanded' en vez de 'tpcollapsed') no hace nada.
+
+    El texto del label se ve "TRANSACTION FILTERS" en mayúsculas por CSS
+    (text-transform), pero el DOM real tiene "Transaction Filters" — mismo motivo por
+    el que el resto del código nunca usa exact=True/mayúsculas fijas para estos labels
+    (ver reactivate_creditor). El toggle solo reacciona al click sobre el ícono
+    (i.groupicon), no sobre el texto en sí (confirmado en vivo: clickear el texto no
+    cambia la clase tpcollapsed/tpexpanded).
+
+    Reintenta y VERIFICA que la clase haya cambiado a 'tpexpanded' antes de seguir —
+    el click a veces no registra al primer intento (mismo race de Angular ya visto en
+    _activate_selection_tab). Sin esta verificación, un solo click que no registra deja
+    el resto de la corrida rota: este componente NO se destruye entre proveedores (
+    persiste en la sesión), así que si _set_currency_filter asume que ya está expandido
+    y no lo está, el input de CURRENCY queda oculto y sus clicks fallan para TODOS los
+    proveedores siguientes de la misma corrida — confirmado en vivo (2026-09-28): un
+    batch de 27 proveedores dio "(ninguno)" en el 100% de los casos por este motivo,
+    incluidos proveedores con cientos de invoices reales conocidos.
+
+    Devuelve True si el panel quedó expandido (o ya lo estaba), False si no se pudo
+    confirmar tras todos los intentos (el caller decide si seguir igual).
+
+    Click nativo por JS (page.evaluate + icon.click()), NO Playwright .click(force=True)
+    — confirmado en vivo (2026-09-30, 1ING01): un <dialog> vacío del pool de Angular
+    puede quedar posicionado ENCIMA del ícono (document.elementFromPoint() ahí devuelve
+    el dialog, no el ícono). .click(force=True) de Playwright salta el chequeo de
+    actionability pero sigue disparando un evento de mouse en esas coordenadas reales,
+    así que el navegador se lo entrega al dialog que está arriba, no al ícono — el click
+    nunca llega. El .click() nativo de JS invoca el handler directo sobre el elemento,
+    sin pasar por hit-testing del navegador, así que funciona igual aunque algo lo tape
+    visualmente (mismo motivo por el que click_hamburger ya usa este patrón)."""
+    group = page.locator("tp-group[tptype='TransactionFilterGroup']").first
+    for _ in range(attempts):
+        cls = group.get_attribute("class") or ""
+        if "tpcollapsed" not in cls:
+            return True
+        page.evaluate("""
+            () => {
+                const g = document.querySelector("tp-group[tptype='TransactionFilterGroup']");
+                const icon = g && g.querySelector('i.groupicon');
+                if (icon) icon.click();
+            }
+        """)
+        waited = 0
+        while waited < per_attempt_ms:
+            page.wait_for_timeout(200)
+            waited += 200
+            if "tpcollapsed" not in (group.get_attribute("class") or ""):
+                return True
+    return False
+
+
+def _wait_for_currency_grid(page: Page, currency: str, timeout_ms: int = 10000) -> None:
+    """Espera a que la grilla refleje la moneda pedida tras cambiar el filtro CURRENCY.
+
+    No alcanza con esperar 'hay filas': si la moneda anterior tenía la misma cantidad de
+    filas (o más), se podría leer la grilla vieja antes de que Angular termine de
+    re-renderizar. Se poll ea hasta que la PRIMERA fila sea de la moneda pedida, o hasta
+    timeout (grilla genuinamente vacía para esa moneda — el caller igual filtra por
+    moneda al leer, así que una fila vieja que quede no contamina el resultado)."""
     waited = 0
-    step = 500
+    step = 400
     while waited < timeout_ms:
-        try:
-            rows = page.locator("tr.tpgrid").count()
-        except Exception:
-            rows = 0
-        if rows > 0:
-            page.wait_for_timeout(step)  # settle: dejar que termine de poblar
-            return rows
+        state = page.evaluate(
+            """(cur) => {
+                const rows = Array.from(document.querySelectorAll('tr.tpgrid'));
+                if (rows.length === 0) return 'empty';
+                const firstCur = (rows[0].querySelector('td.tpcol-currency')?.textContent || '').trim();
+                return firstCur === cur ? 'match' : 'stale';
+            }""",
+            currency,
+        )
+        if state == "match":
+            page.wait_for_timeout(300)
+            return
         page.wait_for_timeout(step)
         waited += step
-    return 0
 
 
-def read_invoice_summary_by_currency(page: Page) -> dict:
-    """Lee la grilla de Transactions y devuelve {moneda: {date, total}} de los invoices.
+def _native_click(locator, timeout_ms: int = 8000) -> None:
+    """Click nativo por JS (locator.evaluate("el => el.click()")) en vez de
+    Locator.click() de Playwright.
 
-    Recorre las filas `tr.tpgrid` con TYPE="Invoice", agrupa por su CURRENCY y suma
-    los AMOUNT (el total por moneda = CHEQUE TOTAL del cheque, para que cuadre el
-    REMAINDER). La fecha es la del primer invoice de la moneda; si hay fechas distintas
-    deja un warning.
+    Confirmado en vivo (2026-09-30, 1EURO1): un <tp-spinner> con un <dialog> vacío
+    puede quedar flotando ENCIMA de estos inputs/botones mientras la cuenta todavía está
+    cargando datos en segundo plano ("dialog ... subtree intercepts pointer events").
+    Locator.click() dispara un evento de mouse en coordenadas reales, que el navegador
+    entrega a lo que esté arriba (el spinner), no al elemento — se cuelga 8s reintentando
+    para nada. .evaluate() invoca el handler directo sobre el elemento que Playwright ya
+    resolvió, sin pasar por hit-testing del navegador (mismo patrón que
+    _open_transaction_filters usa para el ícono del panel)."""
+    locator.first.evaluate("el => el.click()", timeout=timeout_ms)
+
+
+def _get_available_currencies(page: Page) -> list[str]:
+    """Abre el dropdown de CURRENCY y devuelve las monedas que el dropdown realmente
+    lista para ESTE proveedor (además de "ALL"), sin seleccionar ninguna.
+
+    El dropdown NO es una lista fija global — solo lista las monedas que el proveedor
+    tiene (confirmado en vivo, 2026-09-28: 1ACUS1 solo tenía "ALL"/"ARS", nunca "USD").
+    Iterar ciegamente sobre FILTER_CURRENCIES hacía que _set_currency_filter esperara 8s
+    por una fila que nunca iba a aparecer para la moneda ausente — no era un error, era
+    la respuesta correcta del sistema. Leer las opciones reales evita esa espera inútil
+    y la falsa categorización como "falla"."""
+    currency_input = page.get_by_text("Currency", exact=True).first.locator(
+        "xpath=following::input[1]"
+    )
+    _native_click(currency_input)
+    page.wait_for_timeout(400)
+    texts = page.locator(".dropdown table tr:visible").all_inner_texts()
+    currencies = []
+    for t in texts:
+        code = t.strip().split()[0] if t.strip() else ""
+        if code and code != "ALL" and code not in currencies:
+            currencies.append(code)
+    # Cerrar el dropdown sin cambiar nada: seleccionar "ALL" (siempre presente) es
+    # inocuo, ya que el próximo _set_currency_filter va a sobreescribir el filtro igual.
+    _native_click(page.locator(".dropdown table tr:visible").filter(has_text="ALL"))
+    page.wait_for_timeout(300)
+    _native_click(page.get_by_role("button", name="OK"))
+    return currencies
+
+
+def _set_currency_filter(page: Page, currency: str) -> None:
+    """Filtra la grilla de Transactions por una moneda específica (panel TRANSACTION
+    FILTERS) y ejecuta OK.
+
+    Confirmado en vivo (1SHE14, 2026-09-28): con CURRENCY='ALL - ALL' (el default tras
+    navegar) la grilla mostraba 17 invoices ARS y CERO USD — pero filtrando
+    explícitamente por USD aparecían 42 invoices reales (32 nunca cobrados) + 10 cheques
+    ya aplicados, invisibles en la vista 'ALL'. Por eso hay que pedir cada moneda por
+    separado en vez de confiar en 'ALL'.
     """
-    # Esperar a que la grilla cargue antes de leer (evita leerla vacía por timing).
-    _wait_for_transactions_grid(page)
+    # "Currency" (no "CURRENCY": ver _open_transaction_filters). .first toma el label
+    # del panel de filtros, que precede en el DOM al header de la misma columna en la
+    # grilla (confirmado en vivo: ambos "Currency" quedan visibles simultáneamente).
+    currency_input = page.get_by_text("Currency", exact=True).first.locator(
+        "xpath=following::input[1]"
+    )
+    _native_click(currency_input)
+    page.wait_for_timeout(300)
+    # ":visible" — no alcanza con ".dropdown table tr" a secas: ".dropdown" es una clase
+    # genérica reusada por otros combos de la página (búsqueda de proveedor, PAYMENT
+    # TYPE), y una instancia vieja oculta del pool de Angular puede seguir matcheando el
+    # selector sin tener "ARS"/"USD" en su texto — confirmado en vivo (2026-09-28, ~14
+    # proveedores distintos): Locator.click quedaba 30s esperando una fila que nunca
+    # iba a aparecer porque el dropdown real todavía no estaba en el DOM o el que
+    # matcheaba primero era el viejo.
+    row = page.locator(".dropdown table tr:visible").filter(has_text=currency)
+    _native_click(row)
+    page.wait_for_timeout(300)
+    _native_click(page.get_by_role("button", name="OK"))
+    _wait_for_currency_grid(page, currency)
 
-    data = page.evaluate("""
-        () => {
-            const out = {};
-            const num = (s) => parseFloat((s || '0').replace(/,/g, '')) || 0;
-            const rows = Array.from(document.querySelectorAll('tr.tpgrid'));
-            for (const r of rows) {
-                const type = (r.querySelector('td.tpcol-transactiontype')?.textContent || '').trim();
-                if (type !== 'Invoice') continue;
-                const cur = (r.querySelector('td.tpcol-currency')?.textContent || '').trim();
-                const date = (r.querySelector('td.tpcol-date')?.textContent || '').trim();
-                const amt = num(r.querySelector('td.tpcol-transactionamount')?.textContent);
-                if (!cur || !date) continue;
-                if (!(cur in out)) out[cur] = { date, dates: [date], total: 0 };
-                else if (!out[cur].dates.includes(date)) out[cur].dates.push(date);
-                out[cur].total += amt;
+
+def read_invoice_summary_by_currency(page: Page, supplier_code: str) -> dict:
+    """Lee la grilla de Transactions y devuelve {moneda: {date, total}} de los invoices
+    QUE NOSOTROS CARGAMOS (no todo lo que TourplanNX muestre como pendiente).
+
+    Pide cada moneda que el proveedor realmente tiene (ver _get_available_currencies)
+    por separado vía el filtro CURRENCY (ver _set_currency_filter) en vez de leer el
+    default 'ALL - ALL', que en TourplanNX oculta todas las monedas salvo una. Para cada
+    moneda: recorre las filas `tr.tpgrid` con TYPE="Invoice", esa moneda exacta (evita
+    contaminación por filas viejas que no hayan terminado de refrescar), Y cuya
+    REFERENCE (columna td.tpcol-transactionreference) contenga supplier_code — nuestro
+    pipeline de invoices siempre genera la REFERENCE como "INV{row_index}{supplier_code}"
+    (ver modules/transaction_creator.py), así que ese substring identifica de forma
+    confiable las facturas que cargamos nosotros, sin tocar historial previo de la
+    cuenta. Confirmado en vivo (2026-09-30, 1ING01): sin este filtro, la búsqueda traía
+    21.555 invoices pendientes de los que solo 75 eran nuestros — el resto, años de
+    historial acumulado que no nos corresponde pagar en una corrida automática.
+
+    Suma los AMOUNT (el total = CHEQUE TOTAL del cheque). La fecha es la del primer
+    invoice; si hay fechas distintas deja un warning.
+    """
+    if not _open_transaction_filters(page):
+        # No se pudo confirmar que el panel quedó expandido tras varios intentos: seguir
+        # igual dejaría el input de CURRENCY oculto y cada _set_currency_filter fallaría
+        # por 8s por moneda para nada. Mejor cortar acá con un resultado vacío explícito
+        # (el caller lo trata igual que "sin invoices en la grilla") que arriesgar dejar
+        # el componente en un estado raro para el resto de la corrida.
+        log.warning("    No se pudo expandir Transaction Filters — sin datos de moneda para este proveedor")
+        return {}
+
+    try:
+        currencies = _get_available_currencies(page)
+    except Exception as e:
+        log.warning("    No se pudo leer las monedas disponibles del filtro: %s", e)
+        return {}
+
+    result: dict[str, dict] = {}
+    for currency in currencies:
+        try:
+            _set_currency_filter(page, currency)
+        except Exception as e:
+            # Que falle el filtro de UNA moneda (ej. dropdown que no respondió a
+            # tiempo) no debe perder la otra moneda del mismo proveedor — se salta y
+            # se sigue con la próxima en vez de abortar toda la lectura.
+            log.warning("    No se pudo filtrar por moneda %s — se salta: %s", currency, e)
+            continue
+
+        data = page.evaluate(
+            """([cur, code]) => {
+                const num = (s) => parseFloat((s || '0').replace(/,/g, '')) || 0;
+                const rows = Array.from(document.querySelectorAll('tr.tpgrid'));
+                const out = { dates: [], total: 0 };
+                for (const r of rows) {
+                    const type = (r.querySelector('td.tpcol-transactiontype')?.textContent || '').trim();
+                    if (type !== 'Invoice') continue;
+                    const rowCur = (r.querySelector('td.tpcol-currency')?.textContent || '').trim();
+                    if (rowCur !== cur) continue;
+                    const ref = (r.querySelector('td.tpcol-transactionreference')?.textContent || '').trim();
+                    if (!ref.includes(code)) continue;
+                    const date = (r.querySelector('td.tpcol-date')?.textContent || '').trim();
+                    const amt = num(r.querySelector('td.tpcol-transactionamount')?.textContent);
+                    if (!date) continue;
+                    if (!out.dates.includes(date)) out.dates.push(date);
+                    out.total += amt;
+                }
+                return out;
+            }""",
+            [currency, supplier_code],
+        ) or {"dates": [], "total": 0}
+
+        if data.get("dates"):
+            dates_sorted = sorted(data["dates"], key=lambda d: _parse_tp_date(d) or (0, 0, 0))
+            earliest, latest = dates_sorted[0], dates_sorted[-1]
+            # search_until debe cubrir la factura MÁS NUEVA de la moneda, no la primera
+            # encontrada: si el proveedor tiene invoices de meses distintos (cargados en
+            # corridas separadas), acotar la ventana de búsqueda de Select Invoice Lines
+            # a partir de la primera fecha deja afuera las más nuevas (ver
+            # confirm_and_select_invoices) — confirmado en vivo con 1SHE14 (2026-09-28):
+            # invoices de junio y septiembre, search_until calculado solo desde junio
+            # daba FOUND=0 para todo, septiembre incluido.
+            result[currency] = {
+                "date": earliest,
+                "search_until": _last_day_of_next_month(latest) or latest,
+                "total": round(data.get("total", 0), 2),
             }
-            return out;
-        }
-    """) or {}
-    result = {}
-    for cur, info in data.items():
-        result[cur] = {"date": info["date"], "total": round(info.get("total", 0), 2)}
-        if len(info.get("dates", [])) > 1:
-            log.warning("    Moneda %s con invoices de fechas distintas %s — usando %s",
-                        cur, info["dates"], info["date"])
+            if len(dates_sorted) > 1:
+                log.warning("    Moneda %s con invoices de fechas distintas %s — due=%s, "
+                            "búsqueda hasta %s", currency, dates_sorted, earliest,
+                            result[currency]["search_until"])
+
     log.info("    Invoices en grilla por moneda: %s",
              ", ".join(f"{c}={v['total']:.2f}@{v['date']}" for c, v in result.items()) or "(ninguno)")
     return result
@@ -182,6 +383,21 @@ _MESES_CAP = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
+def _parse_tp_date(date_str: str) -> tuple[int, int, int] | None:
+    """Parsea 'DD/Mon/YYYY' a (year, month, day) para poder ordenar/comparar fechas
+    de TourplanNX. None si no parsea."""
+    try:
+        parts = date_str.strip().split("/")
+        if len(parts) != 3:
+            return None
+        day = int(parts[0])
+        month = _MESES_CAP.index(parts[1].strip().title()) + 1
+        year = int(parts[2])
+        return (year, month, day)
+    except (ValueError, IndexError, AttributeError):
+        return None
+
+
 def _last_day_of_next_month(due_date_str: str) -> str | None:
     """De una fecha 'DD/Mon/YYYY' (ej '19/Jun/2026') devuelve el último día del mes
     SIGUIENTE en el mismo formato (ej '31/Jul/2026'). None si no parsea.
@@ -243,13 +459,18 @@ def _activate_selection_tab(page: Page, attempts: int = 4, per_attempt_ms: int =
         while waited < per_attempt_ms:
             # Visibilidad REAL (no solo bounding box): la tab inactiva usa visibility:hidden,
             # que da rect>0 pero Playwright (y un click real) lo trata como no visible.
+            # NO se chequea offsetParent: un <dialog> nativo mostrado con showModal() vive
+            # en el "top layer" del navegador y SIEMPRE tiene offsetParent === null aunque
+            # esté perfectamente visible — confirmado en vivo (2026-09-28) como falso
+            # negativo que colgaba 30s con el modal ya abierto (ver
+            # _wait_for_select_invoice_lines_visible, mismo bug).
             search_visible = page.evaluate(
                 "() => { const d = Array.from(document.querySelectorAll('dialog[open]')).pop();"
                 " const b = d && d.querySelector('button.tpsearch');"
                 " if (!b) return false;"
                 " const r = b.getBoundingClientRect();"
                 " const st = window.getComputedStyle(b);"
-                " return r.width > 0 && r.height > 0 && b.offsetParent !== null"
+                " return r.width > 0 && r.height > 0"
                 "        && st.visibility !== 'hidden' && st.display !== 'none'; }"
             )
             if search_visible:
@@ -286,16 +507,102 @@ def _select_all_and_wait_ok(page: Page, attempts: int = 4, per_attempt_ms: int =
     return False
 
 
-def confirm_and_select_invoices(page: Page, payment_due_date: str) -> int:
+def _wait_for_select_invoice_lines_visible(page: Page, timeout_ms: int | None = None) -> bool:
+    """Polling nativo: True apenas algún <dialog open> con texto 'Select Invoice Lines'
+    esté REALMENTE visible (bounding box > 0, visibility/display), no solo presente en
+    el DOM. Ver comentario en confirm_and_select_invoices.
+
+    NO se chequea offsetParent: confirmado en vivo (2026-09-28, supplier TEMP) que un
+    <dialog> nativo mostrado con showModal() vive en el "top layer" del navegador y
+    SIEMPRE tiene offsetParent === null (w=1728 h=810, visibility=visible,
+    display=block, offsetParent=null) — con ese chequeo esta función daba falso
+    negativo SIEMPRE para este modal, colgando 30s en cada cheque aunque ya estuviera
+    abierto y listo para usar."""
+    timeout_ms = timeout_ms if timeout_ms is not None else MODAL_TIMEOUT
+    waited = 0
+    step = 300
+    while waited < timeout_ms:
+        visible = page.evaluate("""
+            () => {
+                const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
+                return dialogs.some(d => {
+                    if (!(d.textContent || '').includes('Select Invoice Lines')) return false;
+                    const r = d.getBoundingClientRect();
+                    const st = window.getComputedStyle(d);
+                    return r.width > 0 && r.height > 0
+                           && st.visibility !== 'hidden' && st.display !== 'none';
+                });
+            }
+        """)
+        if visible:
+            return True
+        page.wait_for_timeout(step)
+        waited += step
+    return False
+
+
+def _check_and_dismiss_transaction_error(page: Page) -> str | None:
+    """Busca un dialog con texto "Transaction error" (ej. "Error! 1038 Transaction
+    error. Error is Reference Exists"), lo cierra con su botón, y devuelve el texto si
+    lo encontró (None si no había ninguno).
+
+    TourplanNX puede tirar este error en MÁS DE UN punto del flujo del cheque — no solo
+    al abrir Select Invoice Lines, sino también recién al hacer SAVE final (confirmado
+    en vivo, 2026-09-30, 1CATP1: la referencia ya existía de una prueba anterior del
+    mismo día, y el error apareció DESPUÉS de "Warning de descuadre confirmado", en el
+    paso de guardado — save_cheque no lo reconocía y esperaba los 10 minutos completos
+    del timeout para nada). Por eso esta función es compartida entre
+    confirm_and_select_invoices y save_cheque, no exclusiva de un solo punto."""
+    error_text = page.evaluate("""
+        () => {
+            const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
+            const err = dialogs.find(d => (d.textContent || '').includes('Transaction error'));
+            return err ? (err.textContent || '').replace(/\\s+/g, ' ').trim() : null;
+        }
+    """)
+    if error_text:
+        page.evaluate("""
+            () => {
+                const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
+                const err = dialogs.find(d => (d.textContent || '').includes('Transaction error'));
+                const btn = err && err.querySelector('button');
+                if (btn) btn.click();
+            }
+        """)
+        page.wait_for_timeout(500)
+    return error_text
+
+
+def confirm_and_select_invoices(page: Page, payment_due_date: str, supplier_code: str,
+                                search_until_date: str | None = None) -> tuple[int, int]:
     """Click OK → modal 'Select Invoice Lines' → SELECT ALL → OK. Vuelve a 'Insert Cheque'.
 
+    Se probó tildar checkboxes de a tandas para no seleccionar 1000+ invoices de una,
+    pero esta grilla resultó ser de selección ÚNICA por fila (ver create_cheque) — no es
+    viable. Se usa siempre SELECT ALL, que soporta selecciones grandes sin problema
+    (1AER01/USD: 1094 invoices aplicados en una sola corrida).
+
+    Filtra por "Reference Contains" = supplier_code ANTES de buscar: sin esto, SELECT ALL
+    trae TODO lo que TourplanNX considere pendiente para esa moneda, incluido historial
+    de años previo a este pipeline — confirmado en vivo (2026-09-30, 1ING01): 21.555
+    invoices encontrados, de los cuales solo 75 eran nuestros (el resto, acumulado
+    histórico que no nos corresponde pagar en una corrida automática). Nuestro pipeline
+    de invoices siempre genera la REFERENCE como "INV{row_index}{supplier_code}" (ver
+    modules/transaction_creator.py), así que ese substring alcanza para acotar la
+    búsqueda a solo lo que nosotros cargamos.
+
     Args:
-        payment_due_date: fecha del invoice ('DD/Mon/YYYY'). Se usa solo para calcular el
-            filtro PAYMENT DATE TO (último día del mes siguiente); NO modifica la fecha
+        payment_due_date: fecha del invoice ('DD/Mon/YYYY'). Fallback para calcular el
+            filtro PAYMENT DATE TO si no se pasa search_until_date; NO modifica la fecha
             del cheque.
+        search_until_date: valor ya calculado para el filtro PAYMENT DATE TO (ver
+            read_invoice_summary_by_currency: debe cubrir la factura MÁS NUEVA de la
+            moneda, no solo la primera). Si no se pasa, cae a
+            _last_day_of_next_month(payment_due_date) (comportamiento previo).
 
     Returns:
-        Cantidad de invoices (FOUND) aplicados al cheque.
+        (found, loaded): invoices efectivamente aplicados (SELECT ALL, así que found ==
+        loaded salvo que algo falle) y el total que la búsqueda encontró.
     """
     # El OK del Create Transaction tiene clase tpinvoicelines (no tpok); se ubica por
     # rol/nombre como en confirm_bulk_transaction del pipeline de invoices.
@@ -304,8 +611,35 @@ def confirm_and_select_invoices(page: Page, payment_due_date: str) -> int:
     expect(ok_btn).to_be_enabled(timeout=MODAL_TIMEOUT)
     ok_btn.click()
 
+    # TourplanNX puede responder con un error en vez de abrir Select Invoice Lines (ej.
+    # "Error! 1038 Transaction error. Error is Reference Exists" cuando la REFERENCE ya
+    # existe) — confirmado en vivo (2026-09-30): sin este chequeo, el código esperaba
+    # 30-60s a un modal que nunca iba a aparecer y terminaba reportando "sin invoices"
+    # (FOUND=0), escondiendo el error real. Se detecta por el texto "Transaction error"
+    # y se cierra el dialog para no dejarlo bloqueando el resto del flujo.
+    page.wait_for_timeout(500)
+    error_text = _check_and_dismiss_transaction_error(page)
+    if error_text:
+        if "Reference Exists" in error_text:
+            raise ReferenceExistsError(error_text)
+        raise RuntimeError(f"TourplanNX rechazó la transacción: {error_text}")
+
+    # Espera de VISIBILIDAD REAL (no solo presencia en el DOM) por polling nativo, no
+    # sil.wait_for(state="visible") de Playwright: en sesiones largas (cientos de
+    # proveedores seguidos) el pool de <dialog> de Angular puede dejar más de una
+    # instancia con el texto "Select Invoice Lines" (una vieja oculta de una iteración
+    # anterior), y get_by_role(...).filter(has_text=...).last podía terminar apuntando a
+    # la instancia equivocada, colgando 30s+ aunque el modal correcto ya estuviera abierto
+    # — mismo patrón ya resuelto para otros diálogos en este archivo (ver
+    # _activate_selection_tab).
+    # 60s (no MODAL_TIMEOUT=30s default): proveedores con años de historial (ej. 1AER01,
+    # rango de fechas 2021-2026) tardan más en que Angular termine de armar el modal —
+    # confirmado en vivo (2026-09-29) fallando consistentemente a los 30s.
+    if not _wait_for_select_invoice_lines_visible(page, timeout_ms=60000):
+        log.warning("    Select Invoice Lines no llegó a abrirse visible — abortando")
+        _dump_modal_state(page, "cheque_select_invoice_lines_no_abre")
+        return 0, 0
     sil = page.get_by_role("dialog").filter(has_text="Select Invoice Lines").last
-    sil.wait_for(state="visible", timeout=MODAL_TIMEOUT)
     log.info("    Select Invoice Lines abierto")
 
     # El modal tiene tabs SELECTION / RESULTS. Abre mostrando RESULTS vacío ("No results
@@ -316,12 +650,18 @@ def confirm_and_select_invoices(page: Page, payment_due_date: str) -> int:
     if not _activate_selection_tab(page):
         log.warning("    No se pudo activar la tab SELECTION (SEARCH no visible) — abortando")
         _dump_modal_state(page, "cheque_selection_tab_no_activa")
-        return 0
+        return 0, 0
+
+    # "Reference Contains" (misma clase que REFERENCE_SELECTOR, reusada acá con otro
+    # propósito) acota la búsqueda a solo las facturas que nosotros cargamos — ver
+    # docstring de esta función. Sin esto, SELECT ALL trae también historial ajeno.
+    sil.locator(REFERENCE_SELECTOR).fill(supplier_code)
+    log.info("    Reference Contains (filtro) = %s", supplier_code)
 
     # PAYMENT DATE TO: por defecto viene = fecha del invoice y acota la búsqueda a 0.
     # Se setea al último día del mes siguiente para que SEARCH traiga los invoices
     # (solo el filtro; la fecha del cheque queda intacta).
-    payment_date_to = _last_day_of_next_month(payment_due_date)
+    payment_date_to = search_until_date or _last_day_of_next_month(payment_due_date)
     if payment_date_to:
         _set_payment_date_to(page, payment_date_to)
         page.wait_for_timeout(300)
@@ -350,7 +690,7 @@ def confirm_and_select_invoices(page: Page, payment_due_date: str) -> int:
         # disabled). Se captura el DOM del modal para diagnosticar y se aborta limpio:
         # clickear el botón deshabilitado solo agrega un timeout de 30s y una excepción.
         _dump_modal_state(page, "cheque_select_invoice_lines_vacio")
-        return 0
+        return 0, 0
 
     expect(select_all_btn).to_be_enabled(timeout=MODAL_TIMEOUT)
     # Asentar la grilla antes de seleccionar: si se clickea SELECT ALL apenas Found>0,
@@ -358,16 +698,30 @@ def confirm_and_select_invoices(page: Page, payment_due_date: str) -> int:
     # con 172 invoices alcanzaba a asentarse, 1ALT05 con menos no). _select_all_and_wait_ok
     # reintenta hasta que OK quede habilitado.
     page.wait_for_timeout(800)
+
+    # NO se tilda a mano una tanda de N checkboxes: confirmado en vivo (2026-09-30,
+    # 1ATRA1) que esta grilla es de selección ÚNICA por fila (tildar una fila desmarca
+    # la anterior — el contador "Selected" nunca pasa de 1, sin importar cuántas filas
+    # se clickeen). SELECT ALL es el único mecanismo real de selección múltiple; lo que
+    # antes se atribuía a "timeout de guardado por escala" (1ING01/1EURO1/1AER01) era en
+    # realidad el error de REFERENCE duplicada ya manejado más arriba (ver
+    # ReferenceExistsError) — SELECT ALL ya viene probado con 1000+ invoices sin
+    # problema (1AER01/USD: 1094, confirmado en una corrida anterior).
     if not _select_all_and_wait_ok(page):
         log.warning("    OK no se habilitó tras SELECT ALL (selección no registró) — abortando")
         _dump_modal_state(page, "cheque_ok_no_habilita")
-        return 0
+        return 0, loaded
     found = _read_found_count(page) or loaded
     log.info("    SELECT ALL: %s invoices (FOUND)", found)
-    sil.get_by_role("button", name="OK").click()
+
+    # force=True: con selecciones grandes (cientos de invoices) puede quedar otro
+    # <dialog open> del pool de Angular interceptando pointer events sobre este botón
+    # (confirmado en vivo: "dialog ... intercepts pointer events"), igual que ya se
+    # maneja en el resto del código para clicks entre modales anidados.
+    sil.get_by_role("button", name="OK").click(force=True)
     sil.wait_for(state="hidden", timeout=MODAL_TIMEOUT)
     page.wait_for_timeout(800)
-    return found
+    return found, loaded
 
 
 def _read_found_count(page: Page) -> int:
@@ -415,26 +769,41 @@ def _dump_modal_state(page: Page, name: str) -> None:
 
     Se usa cuando la grilla queda vacía (FOUND=0): deja en outputs/screenshots/ una
     foto y un recorte del DOM del modal, para entender qué devolvió el servidor sin
-    tener que reproducir el flujo en producción a mano."""
+    tener que reproducir el flujo en producción a mano.
+
+    Además del último dialog (buttons/inputs), lista TODOS los <dialog open> con su
+    texto y visibilidad real — el diagnóstico original solo miraba botones/inputs del
+    último y nunca mostraba el TEXTO, así que un dialog inesperado (error del servidor,
+    otro distinto a "Select Invoice Lines") quedaba invisible en los logs."""
     from config.settings import SCREENSHOT_DIR
     try:
         SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         page.screenshot(path=str(SCREENSHOT_DIR / f"{name}.png"))
         info = page.evaluate(
             "() => {"
-            " const d = Array.from(document.querySelectorAll('dialog[open]'));"
-            " const m = d.length ? d[d.length - 1] : null;"
-            " if (!m) return {buttons: [], inputs: []};"
-            " const buttons = Array.from(m.querySelectorAll('button')).map(b => ({"
+            " const dialogs = Array.from(document.querySelectorAll('dialog[open]'));"
+            " const all = dialogs.map((d, i) => {"
+            "   const r = d.getBoundingClientRect();"
+            "   const st = window.getComputedStyle(d);"
+            "   const visible = r.width > 0 && r.height > 0"
+            "     && st.visibility !== 'hidden' && st.display !== 'none';"
+            "   return { i, visible, text: (d.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 300) };"
+            " });"
+            " const m = dialogs.length ? dialogs[dialogs.length - 1] : null;"
+            " const buttons = m ? Array.from(m.querySelectorAll('button')).map(b => ({"
             "   cls: b.className, txt: (b.textContent || '').trim().slice(0, 30),"
-            "   disabled: b.disabled}));"
-            " const inputs = Array.from(m.querySelectorAll('input')).map(i => ({"
-            "   cls: i.className, ph: i.placeholder || '', val: i.value || ''}));"
-            " return {buttons, inputs};"
+            "   disabled: b.disabled})) : [];"
+            " const inputs = m ? Array.from(m.querySelectorAll('input')).map(i => ({"
+            "   cls: i.className, ph: i.placeholder || '', val: i.value || ''})) : [];"
+            " return { count: dialogs.length, all, buttons, inputs };"
             "}"
         )
-        log.warning("    [diag] Modal '%s' botones: %s", name, info.get("buttons"))
-        log.warning("    [diag] Modal '%s' inputs: %s", name, info.get("inputs"))
+        log.warning("    [diag] Modal '%s': %d dialog(s) abiertos", name, info.get("count", 0))
+        for d in info.get("all", []):
+            log.warning("    [diag]   dialog[%d] visible=%s texto=%r",
+                        d["i"], d["visible"], d["text"])
+        log.warning("    [diag] Modal '%s' botones (último): %s", name, info.get("buttons"))
+        log.warning("    [diag] Modal '%s' inputs (último): %s", name, info.get("inputs"))
     except Exception as e:
         log.debug("    [diag] No se pudo capturar el estado del modal: %s", e)
 
@@ -467,9 +836,14 @@ def save_cheque(page: Page) -> None:
         pass
 
     # 2. Modal "Output Documents": cerrar con EXIT (cheque ya guardado, sin PDF).
+    #    También se chequea "Transaction error" en cada vuelta (ver
+    #    _check_and_dismiss_transaction_error): confirmado en vivo que TourplanNX puede
+    #    tirar "Reference Exists" justo acá, no solo al abrir Select Invoice Lines — sin
+    #    este chequeo, save_cheque esperaba los CHEQUE_SAVE_TIMEOUT_MS completos (10min)
+    #    para nada, reportando un timeout genérico que escondía la causa real.
     waited = 0
     step = 1000
-    while waited < SAVE_TIMEOUT_MS:
+    while waited < CHEQUE_SAVE_TIMEOUT_MS:
         try:
             out_docs = page.get_by_role("dialog").filter(has_text="Output Documents")
             if out_docs.count() > 0:
@@ -482,37 +856,80 @@ def save_cheque(page: Page) -> None:
         if page.get_by_role("dialog").count() < dialogs_before:
             log.info("    Cheque guardado (SAVE)")
             return
+        error_text = _check_and_dismiss_transaction_error(page)
+        if error_text:
+            if "Reference Exists" in error_text:
+                raise ReferenceExistsError(error_text)
+            raise RuntimeError(f"TourplanNX rechazó el guardado del cheque: {error_text}")
         page.wait_for_timeout(step)
         waited += step
     raise RuntimeError("El modal de cheque sigue abierto tras SAVE (timeout)")
 
 
 def create_cheque(page: Page, supplier_code: str, currency: str, reference: str,
-                  cheque_total: float, payment_due_date: str, payment_type: str) -> int:
+                  cheque_total: float, payment_due_date: str, payment_type: str,
+                  search_until_date: str | None = None) -> int:
     """Crea un cheque completo para un proveedor+moneda.
 
     INSERT → tab CHEQUE → header (con CHEQUE TOTAL) → OK → Select Invoice Lines
     (SELECT ALL) → OK → SAVE. Ante cualquier error aborta los modales y propaga.
+
+    Si TourplanNX rechaza la REFERENCE por ya existir (Error 1038 "Reference Exists" —
+    confirmado en vivo 2026-09-30: pasa cuando una corrida anterior ya generó esa misma
+    referencia aunque no haya quedado marcada 'ok' en el tracker), reintenta con una
+    referencia distinta (sufijo "-R{n}") hasta 3 veces antes de rendirse.
+
+    NOTA sobre selecciones grandes: se probó tildar checkboxes a mano de a tandas para
+    evitar seleccionar 1000+ invoices de una — resultó que esta grilla es de selección
+    ÚNICA por fila (tildar una desmarca la anterior, confirmado en vivo con 1ATRA1:
+    "Selected" nunca pasaba de 1 sin importar cuántas filas se clickearan), así que esa
+    idea no es viable. Se usa siempre SELECT ALL (ver confirm_and_select_invoices), que
+    ya viene probado con 1000+ invoices sin problema (1AER01/USD: 1094 aplicados).
+
+    search_until_date: ver confirm_and_select_invoices — debe cubrir la factura más
+        nueva de la moneda cuando hay invoices de varios meses.
 
     Returns:
         Cantidad de invoices aplicados (FOUND).
     """
     log.info("  Creando cheque %s (%s, ref=%s, total=%.2f, due=%s)...",
              supplier_code, currency, reference, cheque_total, payment_due_date)
-    try:
-        open_cheque_form(page)
-        fill_cheque_header(page, reference, currency, cheque_total, payment_due_date, payment_type)
-        found = confirm_and_select_invoices(page, payment_due_date)
-        if found <= 0:
-            log.warning("    Cheque %s/%s sin invoices (FOUND=0) — abortando", supplier_code, currency)
-            abort_transaction(page)
-            return 0
-        save_cheque(page)
-        log.info("  Cheque %s/%s guardado: %d invoices aplicados", supplier_code, currency, found)
-        return found
-    except Exception:
+    # El reintento de referencia envuelve el CICLO COMPLETO (no solo la búsqueda): el
+    # error "Reference Exists" puede aparecer tanto al abrir Select Invoice Lines como
+    # recién en el SAVE final (ver _check_and_dismiss_transaction_error) — confirmado en
+    # vivo (2026-09-30, 1CATP1). Si solo se reintentara la búsqueda, un choque detectado
+    # en save_cheque perdía todo lo ya encontrado/seleccionado sin poder reintentar.
+    for ref_attempt in range(4):
+        try_ref = reference if ref_attempt == 0 else f"{reference}-R{ref_attempt}"
         try:
-            abort_transaction(page)
+            open_cheque_form(page)
+            fill_cheque_header(page, try_ref, currency, cheque_total, payment_due_date, payment_type)
+            found, loaded = confirm_and_select_invoices(
+                page, payment_due_date, supplier_code, search_until_date)
+
+            if found <= 0:
+                log.warning("    Cheque %s/%s sin invoices (FOUND=0) — abortando",
+                            supplier_code, currency)
+                abort_transaction(page)
+                return 0
+            save_cheque(page)
+            log.info("  Cheque %s/%s guardado: %d invoices aplicados",
+                     supplier_code, currency, found)
+            return found
+        except ReferenceExistsError:
+            log.warning("    Referencia %s ya existe en TourplanNX — reintentando con otra",
+                        try_ref)
+            try:
+                abort_transaction(page)
+            except Exception:
+                pass
         except Exception:
-            pass
-        raise
+            try:
+                abort_transaction(page)
+            except Exception:
+                pass
+            raise
+
+    log.warning("    Cheque %s/%s: no se encontró una referencia libre tras varios "
+                "intentos — abortando", supplier_code, currency)
+    return 0

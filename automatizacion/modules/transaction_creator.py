@@ -448,9 +448,16 @@ def _set_voucher_range(page: Page, voucher_from: str | None, voucher_to: str | N
     """Setea VOUCHER FROM/TO en la pestaña SELECTION del modal Select Vouchers activo."""
     page.evaluate("""
         ([vFrom, vTo]) => {
-            // El modal Select Vouchers es el último dialog abierto
+            // El modal Select Vouchers: se identifica por contenido, NO por ser el
+            // último en orden DOM — Angular gestiona los <dialog> en un pool
+            // pre-creado de posición fija, así que un dialog anterior que quedó con
+            // el atributo open (ej. una confirmación de guardado en otra pantalla,
+            // en animación de salida) puede aparecer después en el DOM aunque se
+            // haya abierto/cerrado antes. Mismo criterio que usa Python con
+            // get_by_role("dialog").filter(has_text="Select Vouchers").
             const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
-            const modal = dialogs[dialogs.length - 1];
+            const modal = dialogs.find(d => (d.textContent || '').includes('Select Vouchers'))
+                       || dialogs[dialogs.length - 1];
             if (!modal) return;
             // Inputs editables numéricos del modal (VOUCHER FROM = [0], VOUCHER TO = [1])
             const inputs = Array.from(modal.querySelectorAll('input')).filter(
@@ -489,7 +496,8 @@ def _set_service_date_to(page: Page, value: str) -> bool:
     result = page.evaluate("""
         (val) => {
             const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
-            const modal = dialogs[dialogs.length - 1];
+            const modal = dialogs.find(d => (d.textContent || '').includes('Select Vouchers'))
+                       || dialogs[dialogs.length - 1];
             if (!modal) return { set: false, dateTokens: [] };
             const setter = Object.getOwnPropertyDescriptor(
                 window.HTMLInputElement.prototype, 'value').set;
@@ -582,7 +590,8 @@ def _read_found_count(page: Page):
     return page.evaluate("""
         () => {
             const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
-            const modal = dialogs[dialogs.length - 1];
+            const modal = dialogs.find(d => (d.textContent || '').includes('Select Vouchers'))
+                       || dialogs[dialogs.length - 1];
             if (!modal) return null;
             const m = (modal.textContent || '').replace(/\\s+/g, ' ').match(/Found[\\s:]*([\\d,]+)/i);
             return m ? parseInt(m[1].replace(/,/g, ''), 10) : null;

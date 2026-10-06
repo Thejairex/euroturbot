@@ -17,7 +17,7 @@ from config.settings import (
 from config.urls import spa_url
 from core.exceptions import SupplierNotFoundError
 from data.tracker import ProcessTracker
-from modules.creditor_search import open_supplier
+from modules.creditor_search import open_supplier, insert_disabled, reactivate_creditor
 from modules.login import ensure_logged_in
 from modules.supplier_nav import navigate_to_transactions, exit_supplier
 from modules.transaction_creator import abort_transaction
@@ -74,7 +74,8 @@ def _plan_from_tracker(tracker: ProcessTracker) -> dict:
 
 
 def emit_cheque_for_currency(page, tracker: ProcessTracker | None, supplier_code: str,
-                             currency: str, row_index: int, due, total: float) -> str:
+                             currency: str, row_index: int, due, total: float,
+                             search_until_date: str | None = None) -> str:
     """Emite (o reintenta) el cheque de supplier_code/currency si no hay uno 'ok' ya
     (idempotente vía tracker.is_cheque_done). Asume la página ya posicionada en
     Transactions de ese proveedor (sin ningún modal abierto). Devuelve 'ok' | 'skipped' | 'failed'."""
@@ -85,7 +86,7 @@ def emit_cheque_for_currency(page, tracker: ProcessTracker | None, supplier_code
     invoice_reference = f"INV{row_index}{supplier_code}"
     try:
         found = create_cheque(page, supplier_code, currency, reference, total, due,
-                              CHEQUE_PAYMENT_TYPE)
+                              CHEQUE_PAYMENT_TYPE, search_until_date)
         if tracker:
             if found and found > 0:
                 tracker.mark_cheque_ok(supplier_code, currency, reference, due,
@@ -163,7 +164,22 @@ def run_cheque_pipeline(page, stats, tracker: ProcessTracker | None = None,
             open_supplier(page, supplier_code)
             navigate_to_transactions(page)
 
-            summary = read_invoice_summary_by_currency(page)
+            # Proveedores que solo aparecen en un archivo de cheques (nunca pasaron por
+            # el pipeline de invoices) pueden seguir con SupplierIsDeleted=true real y
+            # sin reactivar — acá se intenta una vez antes de abrir el cheque (que si no,
+            # falla igual al clickear INSERT, solo que 30s más tarde y sin arreglarlo).
+            if insert_disabled(page):
+                log.warning("  %s: INSERT deshabilitado — intentando reactivar automáticamente...",
+                            supplier_code)
+                try:
+                    if reactivate_creditor(page, supplier_code):
+                        navigate_to_transactions(page)
+                        log.info("  %s reactivado automáticamente — continuando con cheques",
+                                 supplier_code)
+                except Exception as e:
+                    log.error("  Reactivación de %s falló: %s", supplier_code, e)
+
+            summary = read_invoice_summary_by_currency(page, supplier_code)
             # Monedas objetivo: las del tracker; si no hay (modo test), las de la grilla.
             target_currencies = list(currency_rows.keys()) if currency_rows else list(summary.keys())
 
@@ -179,6 +195,7 @@ def run_cheque_pipeline(page, stats, tracker: ProcessTracker | None = None,
                 emit_cheque_for_currency(
                     page, tracker, supplier_code, currency, row_index,
                     due=summary[currency]["date"], total=summary[currency]["total"],
+                    search_until_date=summary[currency].get("search_until"),
                 )
 
             exit_supplier(page)
